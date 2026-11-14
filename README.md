@@ -73,7 +73,7 @@ zobraziteľný súbor, program skončí. Pri videu sa za chybné považuje súbo
 ## Zobrazenie
 
 - Obrázok v skutočnej veľkosti; ak je väčší ako obrazovka, zmenší sa (mipmapy, aby nebol aliasing).
-- Video: ako obrázok; `video-min-size=1280x720` zväčší menšie video, a väčšie ako obrazovka sa vždy zmenší.
+- Video: ako obrázok; `video-min-size=1280x720` zväčší menšie video, `video-max-size=50%` (percentá obrazovky ako `autofit` v mpv; aj `1280x720`, `50%x40%`) zmenší väčšie; väčšie ako obrazovka sa vždy zmenší.
 - `video-fit=fit` (alebo klávesa `v` / `cycle-fit`): vo **fullscreene** sa video zväčší alebo zmenší na celú obrazovku so zachovaním pomeru strán; `real` je skutočná veľkosť. V režime okno sa `fit` nepoužije a obrázkov sa netýka.
 - Kurzor sa skrýva po `cursor-autohide` ms (0 = nikdy). Ak kompozitor nemá `cursor-shape-v1`, použije sa xcursor téma (`XCURSOR_THEME`, `XCURSOR_SIZE`).
 - `background`: `#RRGGBB` alebo `#AARRGGBB` (ako v mpv).

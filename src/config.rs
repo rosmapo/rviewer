@@ -21,7 +21,8 @@ pub struct Config {
     /// Straight (nepremultiplikované) RGBA 0..1.
     pub background: [f32; 4],
     /// Minimálna veľkosť videa (menšie sa zväčší). (0,0) = vypnuté.
-    pub video_min_size: (u32, u32),
+    pub video_min_size: SizeSpec,
+    pub video_max_size: SizeSpec,
     /// true = video sa zväčší/zmenší na obrazovku (`fit`), false = skutočná veľkosť (`real`).
     pub video_fit: bool,
     /// Hlasitosť v percentách.
@@ -70,7 +71,8 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             background: [0.0, 0.0, 0.0, 1.0],
-            video_min_size: (0, 0),
+            video_min_size: SizeSpec::NONE,
+            video_max_size: SizeSpec::NONE,
             video_fit: false,
             volume: 100.0,
             autoload: true,
@@ -118,17 +120,60 @@ pub fn parse_color(v: &str) -> Result<[f32; 4], String> {
     }
 }
 
-fn parse_size(v: &str) -> Result<(u32, u32), String> {
+/// Jeden rozmer: pixely alebo percentá obrazovky.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dim {
+    Px(u32),
+    Pct(f64),
+}
+
+/// Šírka x výška; 0 = bez obmedzenia.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SizeSpec {
+    pub w: Dim,
+    pub h: Dim,
+}
+
+impl SizeSpec {
+    pub const NONE: SizeSpec = SizeSpec { w: Dim::Px(0), h: Dim::Px(0) };
+
+    /// Prepočet na pixely voči referenčnej veľkosti obrazovky.
+    pub fn resolve(&self, rw: f64, rh: f64) -> (f64, f64) {
+        let f = |d: Dim, r: f64| match d {
+            Dim::Px(p) => p as f64,
+            Dim::Pct(p) => (r * p / 100.0).round(),
+        };
+        (f(self.w, rw), f(self.h, rh))
+    }
+}
+
+fn parse_dim(s: &str) -> Result<Dim, String> {
+    let s = s.trim();
+    if let Some(p) = s.strip_suffix('%') {
+        let v: f64 = p.trim().parse().map_err(|_| format!("'{s}' nie je percento"))?;
+        if v < 0.0 {
+            return Err(format!("'{s}' je záporné"));
+        }
+        Ok(Dim::Pct(v))
+    } else {
+        s.parse().map(Dim::Px).map_err(|_| format!("'{s}' nie je veľkosť v px ani v %"))
+    }
+}
+
+/// `0`, `1280x720`, `50%` (šírka aj výška), `50%x40%`, `1280x50%`.
+fn parse_size(v: &str) -> Result<SizeSpec, String> {
     let v = v.trim();
     if v == "0" || v.is_empty() {
-        return Ok((0, 0));
+        return Ok(SizeSpec::NONE);
     }
-    let mut it = v.split(|c| c == 'x' || c == 'X' || c == ',');
-    let w = it.next().and_then(|s| s.trim().parse().ok());
-    let h = it.next().and_then(|s| s.trim().parse().ok());
-    match (w, h) {
-        (Some(w), Some(h)) => Ok((w, h)),
-        _ => Err(format!("veľkosť musí byť ŠxV (napr. 1280x720), dostal som '{v}'")),
+    let parts: Vec<&str> = v.split(|c| c == 'x' || c == 'X' || c == ',').collect();
+    match parts.as_slice() {
+        [one] if one.trim().ends_with('%') => {
+            let d = parse_dim(one)?;
+            Ok(SizeSpec { w: d, h: d })
+        }
+        [w, h] => Ok(SizeSpec { w: parse_dim(w)?, h: parse_dim(h)? }),
+        _ => Err(format!("veľkosť musí byť ŠxV (1280x720) alebo percentá (50% / 50%x40%), dostal som '{v}'")),
     }
 }
 
@@ -146,6 +191,7 @@ impl Config {
                 }
             }
             "video-min-size" => self.video_min_size = parse_size(val)?,
+            "video-max-size" => self.video_max_size = parse_size(val)?,
             "volume" => self.volume = num(val)?.clamp(0.0, 1000.0),
             "autoload" => self.autoload = parse_bool(val)?,
             "ignore-hidden" => self.ignore_hidden = parse_bool(val)?,
@@ -240,7 +286,11 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!((c.background[3] - 0xB2 as f32 / 255.0).abs() < 1e-6);
         assert!((c.background[0] - 0x18 as f32 / 255.0).abs() < 1e-6);
-        assert_eq!(c.video_min_size, (1280, 720));
+        assert_eq!(c.video_min_size, SizeSpec { w: Dim::Px(1280), h: Dim::Px(720) });
+        assert_eq!(parse_size("50%").unwrap(), SizeSpec { w: Dim::Pct(50.0), h: Dim::Pct(50.0) });
+        assert_eq!(parse_size("1280x40%").unwrap().h, Dim::Pct(40.0));
+        assert_eq!(parse_size("50%x25%").unwrap().resolve(1920.0, 1080.0), (960.0, 270.0));
+        assert!(parse_size("abc").is_err());
         assert_eq!((c.sort, c.sort_desc), (SortKey::Date, true));
         assert_eq!(c.volume, 80.0);
         assert!(c.set("video-fit", "fit").is_ok() && c.video_fit);

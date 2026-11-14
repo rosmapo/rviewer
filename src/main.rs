@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use config::SizeSpec;
 use video::{Player, SubOpts};
 use view::View;
 use wayland_client::{backend::WaylandError, globals::registry_queue_init, Connection};
@@ -197,7 +198,7 @@ impl App {
     }
 
     fn show_image(&mut self, img: LoadedImage) {
-        self.view.set_content(img.disp_w as f64, img.disp_h as f64, (0, 0), false);
+        self.view.set_content(img.disp_w as f64, img.disp_h as f64, SizeSpec::NONE, SizeSpec::NONE, false);
         self.fit_window();
         let animated = img.frames.len() > 1;
         let mut frames = img.frames;
@@ -236,7 +237,10 @@ impl App {
                     let dw = (f.w as f64 * f.par.0 as f64 / f.par.1 as f64).round().max(1.0);
                     let dh = f.h as f64;
                     if self.view.cw != dw || self.view.ch != dh {
-                        self.view.set_content(dw, dh, self.cfg.video_min_size, fit);
+                        if let Some((ow, oh)) = self.wl.output_size_px() {
+                            self.view.set_reference(ow as f64, oh as f64);
+                        }
+                        self.view.set_content(dw, dh, self.cfg.video_min_size, self.cfg.video_max_size, fit);
                         refit = true;
                     }
                     self.gfx.upload_yuv(&f);
@@ -300,6 +304,7 @@ impl App {
             return;
         }
         let (ow, oh) = self.wl.output_size_px().unwrap_or((1920, 1080));
+        self.view.set_reference(ow as f64, oh as f64);
         let mut probe = self.view.clone();
         probe.reset();
         probe.set_screen(ow as f64, oh as f64);
