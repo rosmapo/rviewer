@@ -208,6 +208,30 @@ impl Osd {
     }
 
     /// Vyhľadávacia lišta dole.
+    /// Náhľad nad lištou: obrázok vycentrovaný na x (clamp na okraje) a čas pod ním.
+    pub fn draw_thumb(
+        &mut self, gfx: &mut Gfx, s: f32, screen: (f32, f32), x: f32, t: f64, dim: (u32, u32), max: f32, text: [f32; 4],
+    ) {
+        let Some(g) = self.bar else { return };
+        let (w, h) = (dim.0 as f32, dim.1 as f32);
+        if w < 1.0 || h < 1.0 {
+            return;
+        }
+        let k = (max * s / w).min(max * s / h);
+        let (dw, dh) = ((w * k).round(), (h * k).round());
+        let label = fmt_time(t);
+        let tw = self.measure(&label);
+        let (_, lh) = self.line_metrics();
+        let m = 3.0 * s;
+        let bw = dw.max(tw + 2.0 * m);
+        let total = dh + lh + m;
+        let x0 = (x - bw / 2.0).clamp(g.pad, (screen.0 - bw - g.pad).max(g.pad)).round();
+        let y0 = (g.strip_y - total - 2.0 * m - 6.0 * s).max(0.0).round();
+        gfx.fill_rect(x0 - m, y0 - m, bw + 2.0 * m, total + 2.0 * m, [0.0, 0.0, 0.0, 0.75]);
+        gfx.draw_thumb((x0 + (bw - dw) / 2.0).round(), y0, dw, dh);
+        self.draw_text(gfx, (x0 + (bw - tw) / 2.0).round(), y0 + dh + m / 2.0, &label, text);
+    }
+
     pub fn draw_bar(&mut self, gfx: &mut Gfx, s: f32, screen: (f32, f32), st: &BarState, text: [f32; 4], accent: [f32; 4]) {
         let label_w = self.measure(&fmt_time(st.dur)).max(self.measure("00:00")).ceil();
         let g = BarGeom::compute(screen, s, label_w);

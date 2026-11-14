@@ -51,6 +51,10 @@ pub struct Config {
     pub osd_color: [f32; 4],
     pub osd_accent: [f32; 4],
     pub seekbar: bool,
+    /// Náhľad snímku pri prechode myšou po lište.
+    pub thumbnails: bool,
+    /// Najdlhšia strana náhľadu v px (logických).
+    pub thumbnail_size: u32,
     /// Zobrazovať titulky (vložené aj externé).
     pub subtitles: bool,
     /// Slideshow zapnutý od štartu.
@@ -100,6 +104,8 @@ impl Default for Config {
             osd_color: [1.0, 1.0, 1.0, 1.0],
             osd_accent: [0.90, 0.63, 0.05, 1.0],
             seekbar: true,
+            thumbnails: true,
+            thumbnail_size: 200,
             subtitles: true,
             slideshow: false,
             default_bindings: true,
@@ -244,6 +250,14 @@ impl Config {
                 self.slideshow_delay = s;
             }
             "slideshow-loop" => self.slideshow_loop = parse_bool(val)?,
+            "thumbnails" => self.thumbnails = parse_bool(val)?,
+            "thumbnail-size" => {
+                let n = num(val)?;
+                if !(32.0..=1024.0).contains(&n) {
+                    return Err("thumbnail-size musí byť 32 až 1024".into());
+                }
+                self.thumbnail_size = n as u32;
+            }
             "subtitles" => self.subtitles = parse_bool(val)?,
             "sub-languages" => self.sub_languages = exts(val),
             "sub-encoding" => self.sub_encoding = val.to_string(),

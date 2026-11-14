@@ -299,3 +299,156 @@ impl Drop for Player {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
+
+/// Náhľad snímku z lišty.
+pub struct Thumb {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    /// Skutočný čas snímku (s), ak ho dekodér uviedol.
+    pub pts: Option<f64>,
+}
+
+fn extract_thumb(sample: &gst::Sample) -> Option<Thumb> {
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(sample.buffer()?, &info).ok()?;
+    let (w, h) = (info.width() as usize, info.height() as usize);
+    let data = frame.plane_data(0).ok()?;
+    let stride = *frame.plane_stride().first()? as usize;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        rgba.extend_from_slice(data.get(row * stride..row * stride + w * 4)?);
+    }
+    let pts = sample.buffer().and_then(|b| b.pts()).map(|p| p.nseconds() as f64 / 1e9);
+    Some(Thumb { w: w as u32, h: h as u32, rgba, pts })
+}
+
+fn set_flag(p: &gst::Element, nick: &str, on: bool) {
+    let flags = p.property_value("flags");
+    let Some(class) = gst::glib::FlagsClass::with_type(flags.type_()) else { return };
+    let Some(builder) = class.builder_with_value(flags) else { return };
+    let builder = if on { builder.set_by_nick(nick) } else { builder.unset_by_nick(nick) };
+    if let Some(value) = builder.build() {
+        p.set_property_from_value("flags", &value);
+    }
+}
+
+/// Druhý, ľahký prehrávač len na náhľady: pozastavený playbin, seek na pozíciu, malý RGBA snímok.
+pub struct Thumber {
+    pipeline: gst::Element,
+    slot: Arc<Mutex<Option<Thumb>>>,
+    want: Option<f64>,
+    last_seek: Option<(std::time::Instant, f64)>,
+    /// Posledný seek bol rýchly (na kľúčový snímok) a ešte ho treba spresniť.
+    fast: bool,
+}
+
+const THUMB_PERIOD: std::time::Duration = std::time::Duration::from_millis(80);
+/// Po tomto čase bez pohybu sa náhľad spresní presným seekom.
+const THUMB_SETTLE: std::time::Duration = std::time::Duration::from_millis(180);
+
+impl Thumber {
+    /// `(w, h)` = rozmery náhľadu v px (pomer strán videa už musí byť zachovaný).
+    pub fn new(path: &Path, (w, h): (u32, u32), wake_fd: RawFd) -> Result<Thumber> {
+        let uri = gst::glib::filename_to_uri(path, None)?;
+        let tail = format!("videoconvert ! videoscale ! video/x-raw,format=RGBA,width={w},height={h} ! appsink name=thsink");
+        let bin = gst::parse::bin_from_description(&format!("videoflip video-direction=auto ! {tail}"), true)
+            .or_else(|_| gst::parse::bin_from_description(&tail, true))?;
+        let sink = bin
+            .by_name("thsink")
+            .and_then(|e| e.downcast::<gst_app::AppSink>().ok())
+            .ok_or_else(|| anyhow!("appsink pre náhľady chýba"))?;
+        sink.set_property("sync", false);
+        let slot: Arc<Mutex<Option<Thumb>>> = Arc::new(Mutex::new(None));
+        let (s1, s2) = (slot.clone(), slot.clone());
+        sink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    if let Some(t) = extract_thumb(&sample) {
+                        *s1.lock().unwrap() = Some(t);
+                        crate::wake(wake_fd);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .new_preroll(move |sink| {
+                    let sample = sink.pull_preroll().map_err(|_| gst::FlowError::Eos)?;
+                    if let Some(t) = extract_thumb(&sample) {
+                        *s2.lock().unwrap() = Some(t);
+                        crate::wake(wake_fd);
+                    }
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        let pipeline = gst::ElementFactory::make("playbin")
+            .property("uri", uri.as_str())
+            .property("video-sink", bin.to_value())
+            .build()?;
+        set_flag(&pipeline, "audio", false);
+        set_flag(&pipeline, "text", false);
+        pipeline.set_state(gst::State::Paused)?;
+        Ok(Thumber { pipeline, slot, want: None, last_seek: None, fast: false })
+    }
+
+    /// Požiada o náhľad na čase `t` (s); seeky sa obmedzujú na ~12 za sekundu.
+    pub fn request(&mut self, t: f64) {
+        self.want = Some(t);
+        self.service();
+    }
+
+    /// Vybaví čakajúcu požiadavku (rýchly seek na kľúčový snímok) a po pokoji ju spresní presným seekom.
+    pub fn service(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(t) = self.want {
+            if let Some((at, prev)) = self.last_seek {
+                if at.elapsed() < THUMB_PERIOD {
+                    return;
+                }
+                if (prev - t).abs() < 0.05 {
+                    self.want = None;
+                    return;
+                }
+            }
+            let ok = self.seek(t, gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT);
+            self.last_seek = Some((now, t));
+            if ok {
+                self.want = None;
+                self.fast = true;
+            }
+        } else if self.fast {
+            if let Some((at, t)) = self.last_seek {
+                if at.elapsed() >= THUMB_SETTLE {
+                    self.seek(t, gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE);
+                    self.last_seek = Some((now, t));
+                    self.fast = false;
+                }
+            }
+        }
+    }
+
+    fn seek(&self, t: f64, flags: gst::SeekFlags) -> bool {
+        let ns = (t.max(0.0) * 1e9) as u64;
+        self.pipeline.seek_simple(flags, gst::ClockTime::from_nseconds(ns)).is_ok()
+    }
+
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        if self.want.is_some() {
+            Some(self.last_seek.map_or_else(std::time::Instant::now, |(at, _)| at + THUMB_PERIOD))
+        } else if self.fast {
+            self.last_seek.map(|(at, _)| at + THUMB_SETTLE)
+        } else {
+            None
+        }
+    }
+
+    pub fn take(&self) -> Option<Thumb> {
+        self.slot.lock().unwrap().take()
+    }
+}
+
+impl Drop for Thumber {
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}

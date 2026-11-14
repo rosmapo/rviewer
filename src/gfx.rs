@@ -119,6 +119,7 @@ pub struct Gfx {
     tex_y: u32,
     tex_u: u32,
     tex_v: u32,
+    tex_thumb: u32,
     pub max_tex: u32,
     npot_ok: bool,
     mag: i32,
@@ -217,7 +218,7 @@ impl Gfx {
         gl::load_with(|name| egl.get_proc_address(name).map_or(ptr::null(), |p| p as *const c_void));
 
         let mag = if cfg.filter == Filter::Nearest { gl::NEAREST } else { gl::LINEAR } as i32;
-        let (prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, max_tex, npot_ok);
+        let (prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, tex_thumb, max_tex, npot_ok);
         unsafe {
             prog_rgba = program(VS, FS_RGBA, &["u_tex"])?;
             prog_yuv = program(VS, FS_YUV, &["u_y", "u_u", "u_v", "u_nv12", "u_k", "u_range"])?;
@@ -234,6 +235,7 @@ impl Gfx {
             tex_y = new_tex(mag);
             tex_u = new_tex(mag);
             tex_v = new_tex(mag);
+            tex_thumb = new_tex(gl::LINEAR as i32);
             tex_atlas = new_tex(gl::LINEAR as i32);
             let mut m = 0;
             gl::GetIntegerv(gl::MAX_TEXTURE_SIZE, &mut m);
@@ -248,7 +250,7 @@ impl Gfx {
         let bg = [cfg.background[0] * a, cfg.background[1] * a, cfg.background[2] * a, a];
         Ok(Gfx {
             egl, display, surface: esurf, _context: context, wl_egl,
-            prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v,
+            prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, tex_thumb,
             max_tex, npot_ok, mag, bg, width: w, height: h, content: Gpu::None,
         })
     }
@@ -280,6 +282,36 @@ impl Gfx {
             }
         }
         self.content = Gpu::Rgba { w, h };
+    }
+
+    /// Náhľad snímku z lišty (RGBA), vlastná textúra.
+    pub fn upload_thumb(&mut self, w: u32, h: u32, data: &[u8]) {
+        if data.len() < (w * h * 4) as usize {
+            return;
+        }
+        unsafe {
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.tex_thumb);
+            gl::TexImage2D(
+                gl::TEXTURE_2D, 0, gl::RGBA as i32, w as i32, h as i32, 0, gl::RGBA, gl::UNSIGNED_BYTE,
+                data.as_ptr() as *const c_void,
+            );
+        }
+    }
+
+    /// Nakreslí náhľad do obdĺžnika (px buffera, počiatok vľavo hore).
+    pub fn draw_thumb(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let r = self.ndc(x, y, w, h);
+        let p = &self.prog_rgba;
+        unsafe {
+            gl::UseProgram(p.id);
+            gl::Uniform4f(p.rect, r[0], r[1], r[2], r[3]);
+            gl::ActiveTexture(gl::TEXTURE0);
+            gl::BindTexture(gl::TEXTURE_2D, self.tex_thumb);
+            gl::Uniform1i(p.u[0], 0);
+            self.bind_quad();
+            gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        }
     }
 
     pub fn upload_yuv(&mut self, f: &VideoFrame) {

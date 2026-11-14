@@ -59,6 +59,12 @@ Bez GUI toolkitu: text sa kreslí cez `fontdue` (atlas glyfov v GLES2), takže t
 Súbor `input.conf` vstavané skratky len dopĺňa a prepisuje. Skratku odstrániš riadkom `SPACE ignore`, alebo nastavíš
 `default-bindings=no` a v `input.conf` uvedieš všetky skratky, ktoré chceš (vzor je `input.conf` v repozitári).
 
+## Náhľady na lište
+
+Pri prechode myšou po vyhľadávacej lište (a pri ťahaní po nej) sa nad ňou ukáže náhľad snímku s časom, podobne ako `thumbfast`.
+Vytvára ich druhý pipeline GStreameru (pozastavený, rýchly seek na kľúčový snímok, malý RGBA obraz), ktorý sa spustí
+raz pri prvom prechode myšou po lište. Vypnutie: `thumbnails=no`, veľkosť: `thumbnail-size=200`.
+
 ## Slideshow
 
 - Medzerník pri obrázku (alebo `s`, príkaz `slideshow`) spustí/zastaví slideshow; pri videu medzerník ďalej pauzuje.

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use config::SizeSpec;
-use video::{Player, SubOpts};
+use video::{Player, SubOpts, Thumber};
 use view::View;
 use wayland_client::{backend::WaylandError, globals::registry_queue_init, Connection};
 use wl::Input;
@@ -122,6 +122,14 @@ struct App {
     slideshow: bool,
     /// Kedy sa má prepnúť z aktuálneho obrázka (len pri slideshow).
     slide_next: Option<Instant>,
+    /// Náhľady pri lište: druhý pipeline, vytvorí sa pri prvom pohybe myši nad lištou.
+    thumber: Option<Thumber>,
+    thumb_failed: bool,
+    /// Čas, pre ktorý sa náhľad zobrazuje (None = skrytý).
+    thumb_time: Option<f64>,
+    thumb_dim: Option<(u32, u32)>,
+    /// Skutočný čas zobrazeného náhľadu (z dekodéra).
+    thumb_pts: Option<f64>,
 }
 
 impl App {
@@ -132,6 +140,11 @@ impl App {
     fn load_current(&mut self) {
         self.content = Content::None; // zahodí prípadný Player
         self.slide_next = None;
+        self.thumber = None;
+        self.thumb_failed = false;
+        self.thumb_time = None;
+        self.thumb_dim = None;
+        self.thumb_pts = None;
         self.generation += 1;
         self.gfx.clear_content();
         self.view.clear_content();
@@ -224,6 +237,12 @@ impl App {
 
     /// Spracuje výsledky z pracovných vlákien, snímky videa a časovače animácie.
     fn poll_content(&mut self) {
+        if let Some(t) = self.thumber.as_ref().and_then(|th| th.take()) {
+            self.gfx.upload_thumb(t.w, t.h, &t.rgba);
+            self.thumb_dim = Some((t.w, t.h));
+            self.thumb_pts = t.pts;
+            self.dirty = true;
+        }
         while let Ok((g, res)) = self.rx.try_recv() {
             if g != self.generation {
                 continue;
@@ -507,6 +526,11 @@ impl App {
                 Some(mut st) => {
                     st.hover = self.bar_drag || self.osd.bar_zone(self.cursor.0, self.cursor.1);
                     self.osd.draw_bar(&mut self.gfx, s, screen, &st, self.cfg.osd_color, self.cfg.osd_accent);
+                    if let (Some(t), Some(dim)) = (self.thumb_time, self.thumb_dim) {
+                        let x = self.cursor.0 as f32;
+                        let max = self.cfg.thumbnail_size as f32;
+                        self.osd.draw_thumb(&mut self.gfx, s, screen, x, self.thumb_pts.unwrap_or(t), dim, max, self.cfg.osd_color);
+                    }
                 }
                 None => self.osd.clear_bar(),
             }
@@ -552,6 +576,54 @@ impl App {
     fn seek(&mut self, secs: f64) {
         if let Content::Video(p) = &mut self.content {
             p.seek_rel(secs);
+        }
+    }
+
+    /// Náhľad pri myši nad dráhou lišty (alebo pri ťahaní po nej).
+    fn update_thumb(&mut self) {
+        let want = if self.cfg.thumbnails && self.bar_visible() {
+            match &self.content {
+                Content::Video(p) => p.duration_secs().and_then(|d| {
+                    let f = if self.bar_drag {
+                        self.osd.bar_fraction(self.cursor.0)
+                    } else {
+                        self.osd.bar_hit(self.cursor.0, self.cursor.1)
+                    };
+                    f.map(|f| f * d)
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match want {
+            Some(t) => {
+                if self.thumber.is_none() && !self.thumb_failed {
+                    let path = self.list[self.idx].path.clone();
+                    // Pomer strán podľa zobrazeného videa (po rotácii a PAR); najdlhšia strana = thumbnail-size.
+                    let (cw, ch) = (self.view.cw.max(1.0), self.view.ch.max(1.0));
+                    let k = self.cfg.thumbnail_size as f64 / cw.max(ch);
+                    let even = |v: f64| (((v * k).round() as u32).max(2) + 1) & !1;
+                    let dim = (even(cw), even(ch));
+                    match Thumber::new(&path, dim, self.wake_w) {
+                        Ok(th) => self.thumber = Some(th),
+                        Err(e) => {
+                            eprintln!("náhľady: {e}");
+                            self.thumb_failed = true;
+                        }
+                    }
+                }
+                if let Some(th) = &mut self.thumber {
+                    th.request(t);
+                }
+                self.thumb_time = Some(t);
+                self.dirty = true;
+            }
+            None => {
+                if self.thumb_time.take().is_some() {
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -727,6 +799,7 @@ impl App {
                 }
                 self.show_cursor();
                 self.show_bar();
+                self.update_thumb();
             }
             Input::Button { button, pressed } => {
                 if button == BTN_LEFT {
@@ -791,6 +864,9 @@ impl App {
     }
 
     fn tick_timers(&mut self) {
+        if let Some(th) = &mut self.thumber {
+            th.service();
+        }
         if let Some((_, t)) = &self.toast {
             if Instant::now() >= *t {
                 self.toast = None;
@@ -858,6 +934,9 @@ impl App {
             put(t);
         }
         if let Some(t) = self.slide_next {
+            put(t);
+        }
+        if let Some(t) = self.thumber.as_ref().and_then(|th| th.deadline()) {
             put(t);
         }
         if let Some((_, _, t)) = self.pending_place {
@@ -1049,6 +1128,11 @@ fn main() -> Result<()> {
         toast: None,
         slideshow: cfg_slideshow,
         slide_next: None,
+        thumber: None,
+        thumb_failed: false,
+        thumb_time: None,
+        thumb_dim: None,
+        thumb_pts: None,
     };
     app.load_current();
 
