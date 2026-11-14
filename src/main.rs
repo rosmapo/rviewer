@@ -74,6 +74,7 @@ enum Content {
 }
 
 type LoadMsg = (u64, Result<LoadedImage, String>);
+type PreMsg = (PathBuf, Result<LoadedImage, String>);
 
 struct App {
     cfg: Config,
@@ -89,6 +90,11 @@ struct App {
     generation: u64,
     tx: mpsc::Sender<LoadMsg>,
     rx: mpsc::Receiver<LoadMsg>,
+    /// Predčítané susedné obrázky (najviac 2).
+    ptx: mpsc::Sender<PreMsg>,
+    prx: mpsc::Receiver<PreMsg>,
+    cache: Vec<(PathBuf, LoadedImage)>,
+    inflight: std::collections::HashSet<PathBuf>,
     content: Content,
     dirty: bool,
     mods: u8,
@@ -158,6 +164,11 @@ impl App {
         self.wl.toplevel.set_title(name);
         match entry.kind {
             Kind::Image => {
+                if let Some(i) = self.cache.iter().position(|(p, _)| *p == entry.path) {
+                    let (_, img) = self.cache.remove(i);
+                    self.show_image(img);
+                    return;
+                }
                 let (gen, tx, wake_w, max) = (self.generation, self.tx.clone(), self.wake_w, self.gfx.max_tex);
                 std::thread::spawn(move || {
                     let r = imageload::load(&entry.path, max).map_err(|e| format!("{}: {e}", entry.path.display()));
@@ -197,8 +208,13 @@ impl App {
 
     /// Súbor sa nedal zobraziť/prehrať: vyradí ho zo zoznamu a ide na ďalší v smere navigácie.
     fn skip_broken(&mut self) {
-        let removed = self.list.remove(self.idx);
-        eprintln!("preskakujem nezobraziteľný súbor: {}", removed.path.display());
+        eprintln!("preskakujem nezobraziteľný súbor: {}", self.list[self.idx].path.display());
+        self.remove_current();
+    }
+
+    /// Vyradí aktuálny súbor zo zoznamu a ide na ďalší v smere navigácie.
+    fn remove_current(&mut self) {
+        self.list.remove(self.idx);
         if self.list.is_empty() {
             eprintln!("rviewer: žiadne zobraziteľné súbory");
             self.wl.running = false;
@@ -217,6 +233,75 @@ impl App {
         self.goto(n as usize);
     }
 
+    /// Na pozadí načíta susedné obrázky (najprv v smere navigácie), aby listovanie nečakalo na dekódovanie.
+    fn preload_neighbors(&mut self) {
+        if !self.cfg.preload {
+            return;
+        }
+        let n = self.list.len() as i64;
+        let dir: i64 = if self.nav_dir >= 0 { 1 } else { -1 };
+        let wanted: Vec<usize> = [dir, -dir]
+            .iter()
+            .filter_map(|d| {
+                let i = self.idx as i64 + d;
+                (0..n).contains(&i).then_some(i as usize)
+            })
+            .collect();
+        let keep: Vec<PathBuf> = wanted.iter().map(|&i| self.list[i].path.clone()).collect();
+        self.cache.retain(|(p, _)| keep.contains(p));
+        for &i in &wanted {
+            let e = self.list[i].clone();
+            let is_gif = e.path.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("gif"));
+            if !matches!(e.kind, Kind::Image)
+                || is_gif
+                || self.cache.iter().any(|(p, _)| *p == e.path)
+                || self.inflight.contains(&e.path)
+            {
+                continue;
+            }
+            self.inflight.insert(e.path.clone());
+            let (ptx, wake_w, max) = (self.ptx.clone(), self.wake_w, self.gfx.max_tex);
+            std::thread::spawn(move || {
+                let r = imageload::load(&e.path, max).map_err(|er| format!("{}: {er}", e.path.display()));
+                let _ = ptx.send((e.path, r));
+                wake(wake_w);
+            });
+        }
+    }
+
+    /// `run` / `run-remove`: spustí shellový príkaz s hodnotami {path}, {dir}, {name}, {stem}.
+    fn run_external(&mut self, cmd: &str, remove: bool) {
+        let path = self.list[self.idx].path.clone();
+        let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+        let part = |o: Option<&std::ffi::OsStr>| o.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let full = path.to_string_lossy().into_owned();
+        let expanded = cmd
+            .replace("{path}", &quote(&full))
+            .replace("{dir}", &quote(&part(path.parent().map(|p| p.as_os_str()))))
+            .replace("{name}", &quote(&part(path.file_name())))
+            .replace("{stem}", &quote(&part(path.file_stem())));
+        let spawned = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&expanded)
+            .env("RVIEWER_PATH", &full)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn();
+        match spawned {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                let short: String = cmd.chars().take(40).collect();
+                self.toast(format!("Spustené: {short}"));
+                if remove {
+                    self.remove_current();
+                }
+            }
+            Err(e) => self.toast(format!("Príkaz zlyhal: {e}")),
+        }
+    }
+
     fn show_image(&mut self, img: LoadedImage) {
         self.view.set_content(img.disp_w as f64, img.disp_h as f64, SizeSpec::NONE, SizeSpec::NONE, false);
         self.fit_window();
@@ -229,6 +314,7 @@ impl App {
         } else {
             Content::Image { anim: None }
         };
+        self.preload_neighbors();
         if self.slideshow {
             self.slide_next = Some(Instant::now() + Duration::from_secs_f64(self.cfg.slideshow_delay));
         }
@@ -242,6 +328,17 @@ impl App {
             self.thumb_dim = Some((t.w, t.h));
             self.thumb_pts = t.pts;
             self.dirty = true;
+        }
+        while let Ok((p, res)) = self.prx.try_recv() {
+            self.inflight.remove(&p);
+            let neighbor = [self.idx.wrapping_sub(1), self.idx + 1]
+                .iter()
+                .any(|&i| self.list.get(i).map_or(false, |e| e.path == p));
+            if let (true, Ok(img)) = (neighbor, res) {
+                if !self.cache.iter().any(|(q, _)| *q == p) {
+                    self.cache.push((p, img));
+                }
+            }
         }
         while let Ok((g, res)) = self.rx.try_recv() {
             if g != self.generation {
@@ -657,6 +754,7 @@ impl App {
                 }
             }
             Command::Slideshow => self.toggle_slideshow(),
+            Command::Run { cmd, remove } => self.run_external(cmd, *remove),
             Command::Next => self.navigate(1),
             Command::Prev => self.navigate(-1),
             Command::First => self.goto(0),
@@ -1083,6 +1181,7 @@ fn main() -> Result<()> {
     let gfx = gfx::Gfx::new(&conn, &st.surface, bw, bh, &cfg)?;
 
     let (tx, rx) = mpsc::channel();
+    let (ptx, prx) = mpsc::channel();
     let mut view = View::new();
     view.set_screen(bw as f64, bh as f64);
     let volume = cfg.volume;
@@ -1100,6 +1199,10 @@ fn main() -> Result<()> {
         scale,
         wake_w,
         generation: 0,
+        ptx,
+        prx,
+        cache: Vec::new(),
+        inflight: std::collections::HashSet::new(),
         tx,
         rx,
         content: Content::None,

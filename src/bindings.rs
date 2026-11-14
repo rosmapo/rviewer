@@ -47,6 +47,8 @@ pub enum Command {
     CycleSub,
     SubDelay(f64),
     Slideshow,
+    /// Spustí shellový príkaz; `remove` = aktuálny súbor zároveň zmizne zo zoznamu (napr. po presune do koša).
+    Run { cmd: String, remove: bool },
     DragPan,
     Ignore,
 }
@@ -178,6 +180,15 @@ pub fn parse_trigger(s: &str) -> Result<Trigger, String> {
 }
 
 pub fn parse_command(s: &str) -> Result<Command, String> {
+    // `run` a `run-remove` berú zvyšok riadku ako shellový príkaz.
+    let s = s.trim();
+    let (head, rest) = s.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((s, ""));
+    if head == "run" || head == "run-remove" {
+        if rest.is_empty() {
+            return Err(format!("príkaz '{head}' potrebuje shellový príkaz"));
+        }
+        return Ok(Command::Run { cmd: rest.to_string(), remove: head == "run-remove" });
+    }
     let mut it = s.split_whitespace();
     let name = it.next().ok_or("chýba príkaz")?;
     let arg = it.next();
@@ -269,6 +280,19 @@ impl Bindings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_command() {
+        assert_eq!(
+            parse_command("run gio trash {path}").unwrap(),
+            Command::Run { cmd: "gio trash {path}".into(), remove: false }
+        );
+        assert_eq!(
+            parse_command("run-remove mv {path} /tmp").unwrap(),
+            Command::Run { cmd: "mv {path} /tmp".into(), remove: true }
+        );
+        assert!(parse_command("run").is_err());
+    }
 
     #[test]
     fn triggers() {
