@@ -6,6 +6,7 @@ mod imageload;
 mod keymap;
 mod osd;
 mod playlist;
+mod subs;
 mod video;
 mod view;
 mod wl;
@@ -21,7 +22,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use video::Player;
+use video::{Player, SubOpts};
 use view::View;
 use wayland_client::{backend::WaylandError, globals::registry_queue_init, Connection};
 use wl::Input;
@@ -112,6 +113,8 @@ struct App {
     seek_target: Option<f64>,
     last_drag_seek: Instant,
     cur_size: u64,
+    /// Krátka správa v OSD (zmena fit, hlasitosti, titulkov...).
+    toast: Option<(String, Instant)>,
 }
 
 impl App {
@@ -141,7 +144,7 @@ impl App {
                     wake(wake_w);
                 });
             }
-            Kind::Video => match Player::new(&entry.path, self.volume, self.muted, self.wake_w) {
+            Kind::Video => match Player::new(&entry.path, self.volume, self.muted, self.wake_w, &self.sub_opts(&entry.path)) {
                 Ok(p) => self.content = Content::Video(p),
                 Err(e) => {
                     eprintln!("{}: {e}", entry.path.display());
@@ -151,6 +154,16 @@ impl App {
                 }
             },
         }
+    }
+
+    fn sub_opts(&self, video: &std::path::Path) -> SubOpts {
+        let ext_uri = if self.cfg.subtitles {
+            subs::find_external(video, &self.cfg.sub_languages)
+                .and_then(|p| gst_uri(&p))
+        } else {
+            None
+        };
+        SubOpts { enabled: self.cfg.subtitles, ext_uri, encoding: self.cfg.sub_encoding.clone(), font: self.cfg.sub_font.clone() }
     }
 
     fn goto(&mut self, new: usize) {
@@ -402,6 +415,7 @@ impl App {
                 l3 += " (stlmené)";
             }
             v.push(l3);
+            v.push(format!("titulky: {}", p.sub_label()));
         }
         v
     }
@@ -411,13 +425,19 @@ impl App {
             return;
         }
         let show_bar = self.bar_visible();
-        if !self.info_on && !show_bar {
+        let toast = self.toast.as_ref().filter(|(_, t)| Instant::now() < *t).map(|(s, _)| s.clone());
+        if !self.info_on && !show_bar && toast.is_none() {
             self.osd.clear_bar();
             return;
         }
         let s = self.scale as f32;
         let screen = ((self.wl.width * self.scale) as f32, (self.wl.height * self.scale) as f32);
         self.osd.set_px(self.cfg.osd_font_size * s);
+        if !self.info_on {
+            if let Some(t) = &toast {
+                self.osd.draw_info(&mut self.gfx, s, screen, &[t.clone()], self.cfg.osd_color);
+            }
+        }
         if self.info_on {
             let lines = self.info_lines();
             self.osd.draw_info(&mut self.gfx, s, screen, &lines, self.cfg.osd_color);
@@ -483,12 +503,18 @@ impl App {
         }
     }
 
+    fn toast(&mut self, text: String) {
+        eprintln!("{text}");
+        self.toast = Some((text, Instant::now() + Duration::from_millis(2000)));
+        self.dirty = true;
+    }
+
     fn change_volume(&mut self, d: f64) {
         self.volume = (self.volume + d).clamp(0.0, 200.0);
         if let Content::Video(p) = &self.content {
             p.set_volume(self.volume);
         }
-        eprintln!("hlasitosť {:.0}", self.volume);
+        self.toast(format!("Hlasitosť: {:.0}%", self.volume));
     }
 
     fn run_command(&mut self, cmd: &Command) {
@@ -522,6 +548,19 @@ impl App {
                 if let Content::Video(p) = &self.content {
                     p.set_mute(self.muted);
                 }
+                self.toast(format!("Zvuk: {}", if self.muted { "stlmený" } else { "zapnutý" }));
+            }
+            Command::CycleSub => {
+                if let Content::Video(p) = &mut self.content {
+                    let msg = p.cycle_subtitle();
+                    self.toast(msg);
+                }
+            }
+            Command::SubDelay(d) => {
+                if let Content::Video(p) = &mut self.content {
+                    let msg = p.change_sub_delay(*d);
+                    self.toast(msg);
+                }
             }
             Command::Info => {
                 self.info_on = !self.info_on;
@@ -533,11 +572,11 @@ impl App {
                     self.view.set_upscale(self.video_fit && self.wl.fullscreen);
                     self.dirty = true;
                 }
-                eprintln!(
-                    "video-fit={}{}",
+                self.toast(format!(
+                    "Video: {}{}",
                     if self.video_fit { "fit" } else { "real" },
                     if self.wl.fullscreen { "" } else { " (platí len vo fullscreene)" }
-                );
+                ));
             }
             Command::ToggleFullscreen => {
                 // Stav sa zmení až po odpovedi kompozitora (apply_resize).
@@ -692,6 +731,12 @@ impl App {
     }
 
     fn tick_timers(&mut self) {
+        if let Some((_, t)) = &self.toast {
+            if Instant::now() >= *t {
+                self.toast = None;
+                self.dirty = true;
+            }
+        }
         if let Some((w, h, t)) = self.pending_place {
             if Instant::now() >= t {
                 // Kompozitor nereagoval: zmeň veľkosť sami (a vycentruj starým hookom, ak je).
@@ -750,6 +795,9 @@ impl App {
         if let Some((_, _, t)) = self.pending_place {
             put(t);
         }
+        if let Some((_, t)) = &self.toast {
+            put(*t);
+        }
         if let Some(t) = self.bar_until {
             put(t);
         }
@@ -763,6 +811,11 @@ impl App {
         }
         d
     }
+}
+
+/// file:// URI pre GStreamer.
+fn gst_uri(p: &std::path::Path) -> Option<String> {
+    gstreamer::glib::filename_to_uri(p, None).ok().map(|u| u.to_string())
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -916,6 +969,7 @@ fn main() -> Result<()> {
         seek_target: None,
         last_drag_seek: Instant::now(),
         cur_size: 0,
+        toast: None,
     };
     app.load_current();
 

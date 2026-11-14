@@ -50,6 +50,14 @@ pub struct Config {
     pub osd_color: [f32; 4],
     pub osd_accent: [f32; 4],
     pub seekbar: bool,
+    /// Zobrazovať titulky (vložené aj externé).
+    pub subtitles: bool,
+    /// Preferované jazyky externých titulkov (v názve súboru: video.sk.srt).
+    pub sub_languages: Vec<String>,
+    /// Kódovanie textových titulkov, napr. CP1250 (prázdne = automaticky).
+    pub sub_encoding: String,
+    /// Pango popis písma titulkov, napr. "Sans Bold 24" (prázdne = predvolené).
+    pub sub_font: String,
     /// Skrytie lišty po nečinnosti (ms), 0 = vždy viditeľná pri videu.
     pub seekbar_timeout_ms: u64,
 }
@@ -82,6 +90,10 @@ impl Default for Config {
             osd_color: [1.0, 1.0, 1.0, 1.0],
             osd_accent: [0.90, 0.63, 0.05, 1.0],
             seekbar: true,
+            subtitles: true,
+            sub_languages: exts("sk,slk,cs,cze,en,eng"),
+            sub_encoding: String::new(),
+            sub_font: String::new(),
             seekbar_timeout_ms: 1500,
         }
     }
@@ -164,6 +176,10 @@ impl Config {
             "osd-font-size" => self.osd_font_size = (num(val)? as f32).clamp(6.0, 200.0),
             "osd-color" => self.osd_color = parse_color(val)?,
             "osd-accent" => self.osd_accent = parse_color(val)?,
+            "subtitles" => self.subtitles = parse_bool(val)?,
+            "sub-languages" => self.sub_languages = exts(val),
+            "sub-encoding" => self.sub_encoding = val.to_string(),
+            "sub-font" => self.sub_font = val.to_string(),
             "seekbar" => self.seekbar = parse_bool(val)?,
             "seekbar-timeout" => self.seekbar_timeout_ms = num(val)?.max(0.0) as u64,
             "window-place-command" => self.window_place_cmd = val.to_string(),

@@ -54,6 +54,16 @@ Bez GUI toolkitu: text sa kreslí cez `fontdue` (atlas glyfov v GLES2), takže t
   (ak je myš nad lištou, ostane). Klik alebo ťah ľavým tlačidlom po dráhe = posun vo videu (pri ťahaní rýchly na keyframe,
   po pustení presný). Pri pauze sa vľavo zobrazí ikona pauzy. Vypnúť sa dá `seekbar=no`.
 
+## Titulky
+
+- Externé: pri videu sa v jeho adresári hľadá `film.srt`, `film.sk.srt`, `film.en.forced.ass` (prípony srt, ass, ssa, vtt, sub, smi);
+  vyberie sa podľa `sub-languages`, potom súbor bez jazyka.
+- Vložené stopy v kontajneri (mkv, mp4) sa zobrazia automaticky.
+- `j` (`cycle-sub`) prepína stopy a nakoniec vypne titulky, `z` / `x` (`sub-delay -0.1` / `0.1`) posúvajú načasovanie.
+  Správa sa zobrazí v OSD, stav je aj v info paneli. `subtitles=no` ich vypne úplne.
+- Staré `.srt` v CP1250: `sub-encoding=CP1250`. Veľkosť a vzhľad: `sub-font=Sans Bold 24`.
+- Treba pluginy `gstreamer1.0-plugins-base` (textoverlay, subparse) a `gstreamer1.0-plugins-bad` (assrender pre ASS/SSA).
+
 ## Nezobraziteľné súbory
 
 `skip-broken=yes` (predvolené): súbor, ktorý sa nepodarí dekódovať alebo prehrať (napr. text s príponou `.jpg`), sa preskočí
@@ -96,10 +106,11 @@ Predvolené:
 | PgUp/PgDn, Enter, Home/End | `prev`/`next`, `first`/`last` |
 | `f`, `F11` | `toggle-fullscreen` (okno ↔ fullscreen) |
 | `v` | `cycle-fit` (video: skutočná veľkosť ↔ fit na obrazovku) |
+| `j`, `z` / `x` | `cycle-sub`, `sub-delay -0.1` / `0.1` (titulky) |
 | `m`, `9`, `0` | `mute`, `volume -2` / `volume 2` |
 | Esc, `q` | `quit` |
 
 ## Čo nie je (zámerne / zatiaľ)
 
-Žiadny OSD/ovládací panel (ako `osc=no`), žiadne titulky, galéria ani prechodové efekty.
+Žiadny ovládací panel s tlačidlami (len vyhľadávacia lišta), galéria ani prechodové efekty. Titulky sa vykresľujú v rozlíšení videa (nie ostro v rozlíšení obrazovky), bez vlastného štýlovania a bez bitmapových titulkov z DVD.
 Zväčšenie je bilineárne (alebo `scale=nearest`), nie spline36. Mierka displeja je len celočíselná.

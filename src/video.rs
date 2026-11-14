@@ -24,6 +24,15 @@ pub struct VideoFrame {
 
 type Slot = Arc<Mutex<Option<VideoFrame>>>;
 
+/// Nastavenia titulkov pre prehrávač.
+pub struct SubOpts {
+    pub enabled: bool,
+    /// URI externého súboru titulkov (suburi).
+    pub ext_uri: Option<String>,
+    pub encoding: String,
+    pub font: String,
+}
+
 pub struct Player {
     pipeline: gst::Element,
     slot: Slot,
@@ -31,6 +40,8 @@ pub struct Player {
     pub eos: bool,
     /// Prišiel už aspoň jeden snímok? (chyba pred prvým snímkom = súbor sa nedá prehrať)
     pub got_frame: bool,
+    sub_on: bool,
+    sub_delay_ms: i64,
 }
 
 fn extract(sample: &gst::Sample) -> Option<VideoFrame> {
@@ -82,7 +93,7 @@ fn store(slot: &Slot, sample: &gst::Sample, wake_fd: RawFd) {
 }
 
 impl Player {
-    pub fn new(path: &Path, volume: f64, mute: bool, wake_fd: RawFd) -> Result<Player> {
+    pub fn new(path: &Path, volume: f64, mute: bool, wake_fd: RawFd, subs: &SubOpts) -> Result<Player> {
         let uri = gst::glib::filename_to_uri(path, None)?;
         let caps = gst::Caps::builder("video/x-raw").field("format", gst::List::new(["NV12", "I420"])).build();
         let sink = gst_app::AppSink::builder().caps(&caps).build();
@@ -120,8 +131,88 @@ impl Player {
             crate::wake(wake_fd);
             gst::BusSyncReply::Pass
         });
-        pipeline.set_state(gst::State::Playing)?;
-        Ok(Player { pipeline, slot, paused: false, eos: false, got_frame: false })
+        // Titulky vykresľuje playbin priamo do snímkov (textoverlay / assrender), appsink dostane hotový obraz.
+        if let Some(u) = &subs.ext_uri {
+            pipeline.set_property("suburi", u.as_str());
+        }
+        if !subs.encoding.is_empty() {
+            pipeline.set_property("subtitle-encoding", subs.encoding.as_str());
+        }
+        if !subs.font.is_empty() {
+            pipeline.set_property("subtitle-font-desc", subs.font.as_str());
+        }
+        let p = Player { pipeline, slot, paused: false, eos: false, got_frame: false, sub_on: subs.enabled, sub_delay_ms: 0 };
+        p.set_text_flag(subs.enabled);
+        p.pipeline.set_state(gst::State::Playing)?;
+        Ok(p)
+    }
+
+    /// Zapne/vypne vykresľovanie titulkov (príznak `text` v playbin `flags`).
+    fn set_text_flag(&self, on: bool) {
+        let flags = self.pipeline.property_value("flags");
+        let Some(class) = gst::glib::FlagsClass::with_type(flags.type_()) else { return };
+        let Some(builder) = class.builder_with_value(flags) else { return };
+        let builder = if on { builder.set_by_nick("text") } else { builder.unset_by_nick("text") };
+        if let Some(value) = builder.build() {
+            self.pipeline.set_property_from_value("flags", &value);
+        }
+    }
+
+    fn text_lang(&self, i: i32) -> Option<String> {
+        let tags = self.pipeline.emit_by_name::<Option<gst::TagList>>("get-text-tags", &[&i])?;
+        for key in ["language-name", "language-code"] {
+            if let Some(v) = tags.generic(key) {
+                if let Ok(s) = v.get::<&str>() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Popis stavu titulkov: "vypnuté", "žiadne" alebo "2/3 (English)".
+    pub fn sub_label(&self) -> String {
+        if !self.sub_on {
+            return "vypnuté".into();
+        }
+        let n: i32 = self.pipeline.property("n-text");
+        if n <= 0 {
+            return "žiadne".into();
+        }
+        let cur: i32 = self.pipeline.property::<i32>("current-text").max(0);
+        match self.text_lang(cur) {
+            Some(l) => format!("{}/{} ({l})", cur + 1, n),
+            None => format!("{}/{}", cur + 1, n),
+        }
+    }
+
+    /// Ďalšia stopa titulkov; po poslednej sa vypnú.
+    pub fn cycle_subtitle(&mut self) -> String {
+        let n: i32 = self.pipeline.property("n-text");
+        if n <= 0 {
+            return "Titulky: žiadne".into();
+        }
+        if !self.sub_on {
+            self.sub_on = true;
+            self.set_text_flag(true);
+            self.pipeline.set_property("current-text", 0i32);
+        } else {
+            let cur: i32 = self.pipeline.property("current-text");
+            if cur + 1 < n {
+                self.pipeline.set_property("current-text", cur + 1);
+            } else {
+                self.sub_on = false;
+                self.set_text_flag(false);
+            }
+        }
+        format!("Titulky: {}", self.sub_label())
+    }
+
+    /// Posun titulkov o `delta` sekúnd (kladné = neskôr).
+    pub fn change_sub_delay(&mut self, delta: f64) -> String {
+        self.sub_delay_ms += (delta * 1000.0).round() as i64;
+        self.pipeline.set_property("text-offset", self.sub_delay_ms * 1_000_000);
+        format!("Posun titulkov: {:+.1} s", self.sub_delay_ms as f64 / 1000.0)
     }
 
     pub fn take_frame(&mut self) -> Option<VideoFrame> {

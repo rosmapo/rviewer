@@ -44,6 +44,8 @@ pub enum Command {
     Info,
     ToggleFullscreen,
     CycleFit,
+    CycleSub,
+    SubDelay(f64),
     DragPan,
     Ignore,
 }
@@ -51,7 +53,7 @@ pub enum Command {
 impl Command {
     /// Opakuje sa pri držaní klávesy.
     pub fn repeatable(&self) -> bool {
-        matches!(self, Command::Seek(_) | Command::SeekOrStep(_) | Command::Zoom(_) | Command::Volume(_))
+        matches!(self, Command::Seek(_) | Command::SeekOrStep(_) | Command::Zoom(_) | Command::Volume(_) | Command::SubDelay(_))
     }
 }
 
@@ -205,6 +207,8 @@ pub fn parse_command(s: &str) -> Result<Command, String> {
         "info" => none(Command::Info),
         "toggle-fullscreen" => none(Command::ToggleFullscreen),
         "cycle-fit" => none(Command::CycleFit),
+        "cycle-sub" => none(Command::CycleSub),
+        "sub-delay" => Ok(Command::SubDelay(num()?)),
         "drag-pan" => none(Command::DragPan),
         "ignore" | "nop" => none(Command::Ignore),
         _ => Err(format!("neznámy príkaz '{name}'")),
