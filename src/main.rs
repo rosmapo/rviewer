@@ -42,7 +42,9 @@ Voľby:
   --input-conf=SÚBOR  iné skratky (predvolene ~/.config/rviewer/input.conf)
   --no-input-conf   len vstavané skratky
   --config-dir=ADRESÁR  použije ADRESÁR/rviewer.conf a ADRESÁR/input.conf
+  --slideshow       spustí slideshow (dĺžka: --slideshow-delay=SEKUNDY)
   --window          okno veľkosti obsahu namiesto fullscreenu (--fullscreen = naspäť)
+  --slideshow       spustí slideshow (dĺžka obrázka: --slideshow-delay=SEKUNDY)
   --KĽÚČ=HODNOTA    prepíše ľubovoľnú voľbu z konfigu (napr. --background=#202020)
   -h, --help        táto pomoc
 
@@ -116,6 +118,10 @@ struct App {
     cur_size: u64,
     /// Krátka správa v OSD (zmena fit, hlasitosti, titulkov...).
     toast: Option<(String, Instant)>,
+    /// Slideshow beží.
+    slideshow: bool,
+    /// Kedy sa má prepnúť z aktuálneho obrázka (len pri slideshow).
+    slide_next: Option<Instant>,
 }
 
 impl App {
@@ -125,6 +131,7 @@ impl App {
 
     fn load_current(&mut self) {
         self.content = Content::None; // zahodí prípadný Player
+        self.slide_next = None;
         self.generation += 1;
         self.gfx.clear_content();
         self.view.clear_content();
@@ -209,6 +216,9 @@ impl App {
         } else {
             Content::Image { anim: None }
         };
+        if self.slideshow {
+            self.slide_next = Some(Instant::now() + Duration::from_secs_f64(self.cfg.slideshow_delay));
+        }
         self.dirty = true;
     }
 
@@ -230,6 +240,7 @@ impl App {
         }
         let mut refit = false;
         let mut broken = false;
+        let mut advance = false;
         let fit = self.video_fit && self.wl.fullscreen;
         match &mut self.content {
             Content::Video(p) => {
@@ -245,6 +256,9 @@ impl App {
                     }
                     self.gfx.upload_yuv(&f);
                     self.dirty = true;
+                }
+                if self.slideshow && p.eos {
+                    advance = true;
                 }
                 for e in p.poll_bus() {
                     eprintln!("video: {e}");
@@ -270,6 +284,36 @@ impl App {
         }
         if broken && self.cfg.skip_broken {
             self.skip_broken();
+        } else if advance && self.slideshow {
+            self.slide_advance();
+        }
+    }
+
+    /// Slideshow: ďalší súbor; po poslednom od začiatku (slideshow-loop) alebo koniec slideshow.
+    fn slide_advance(&mut self) {
+        self.slide_next = None;
+        let last = self.list.len() - 1;
+        if self.idx < last {
+            self.navigate(1);
+        } else if self.cfg.slideshow_loop && last > 0 {
+            self.goto(0);
+            self.nav_dir = 1;
+        } else {
+            self.slideshow = false;
+            self.toast("Slideshow: koniec".into());
+        }
+    }
+
+    fn toggle_slideshow(&mut self) {
+        self.slideshow = !self.slideshow;
+        if self.slideshow {
+            if let Content::Image { .. } = self.content {
+                self.slide_next = Some(Instant::now() + Duration::from_secs_f64(self.cfg.slideshow_delay));
+            }
+            self.toast(format!("Slideshow: zapnutý ({} s)", self.cfg.slideshow_delay));
+        } else {
+            self.slide_next = None;
+            self.toast("Slideshow: vypnutý".into());
         }
     }
 
@@ -407,6 +451,9 @@ impl App {
         if self.cur_size > 0 {
             l2 += &format!("  {}", human_size(self.cur_size));
         }
+        if self.slideshow {
+            l2 += &format!("  slideshow {} s", self.cfg.slideshow_delay);
+        }
         let mut v = vec![name, l2];
         if let Content::Video(p) = &self.content {
             let pos = p.position_secs().map(fmt_time).unwrap_or_else(|| "--:--".into());
@@ -529,7 +576,15 @@ impl App {
         }
         match cmd {
             Command::Quit => self.wl.running = false,
-            Command::Pause => self.toggle_pause(),
+            Command::Pause => {
+                // Pri obrázku medzerník spúšťa/zastavuje slideshow, pri videu pauzuje.
+                if self.current_is_video() {
+                    self.toggle_pause()
+                } else {
+                    self.toggle_slideshow()
+                }
+            }
+            Command::Slideshow => self.toggle_slideshow(),
             Command::Next => self.navigate(1),
             Command::Prev => self.navigate(-1),
             Command::First => self.goto(0),
@@ -742,6 +797,11 @@ impl App {
                 self.dirty = true;
             }
         }
+        if let Some(t) = self.slide_next {
+            if Instant::now() >= t {
+                self.slide_advance();
+            }
+        }
         if let Some((w, h, t)) = self.pending_place {
             if Instant::now() >= t {
                 // Kompozitor nereagoval: zmeň veľkosť sami (a vycentruj starým hookom, ak je).
@@ -795,6 +855,9 @@ impl App {
             put(a.next);
         }
         if let Some(t) = self.center_at {
+            put(t);
+        }
+        if let Some(t) = self.slide_next {
             put(t);
         }
         if let Some((_, _, t)) = self.pending_place {
@@ -867,6 +930,8 @@ fn parse_args() -> Result<Args> {
             no_input = true;
         } else if a == "--window" {
             overrides.push(("fullscreen".to_string(), "no".to_string()));
+        } else if a == "--slideshow" {
+            overrides.push(("slideshow".to_string(), "yes".to_string()));
         } else if a == "--fullscreen" {
             overrides.push(("fullscreen".to_string(), "yes".to_string()));
         } else if let Some((k, v)) = a[2..].split_once('=') {
@@ -883,7 +948,10 @@ fn parse_args() -> Result<Args> {
     let input_path = if no_input { None } else { input_file.or_else(|| dir.as_ref().map(|d| d.join("input.conf"))) };
     if let Some(p) = cfg_path {
         match cfg.load_file(&p) {
-            Ok(w) => w.iter().for_each(|w| eprintln!("{}: {w}", p.display())),
+            Ok(w) => {
+                eprintln!("konfig: {}", p.display());
+                w.iter().for_each(|w| eprintln!("{}: {w}", p.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !cfg_explicit => {}
             Err(e) => eprintln!("{}: {e}", p.display()),
         }
@@ -899,7 +967,10 @@ fn main() -> Result<()> {
     let mut bindings = Bindings::defaults();
     if let Some(p) = &input_path {
         match std::fs::read_to_string(p) {
-            Ok(t) => bindings.load_str(&t).iter().for_each(|w| eprintln!("{}: {w}", p.display())),
+            Ok(t) => {
+                eprintln!("skratky: {}", p.display());
+                bindings.load_str(&t).iter().for_each(|w| eprintln!("{}: {w}", p.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !input_explicit => {}
             Err(e) => eprintln!("{}: {e}", p.display()),
         }
@@ -938,6 +1009,7 @@ fn main() -> Result<()> {
     let volume = cfg.volume;
     let osd = Osd::load(&cfg);
     let video_fit = cfg.video_fit;
+    let cfg_slideshow = cfg.slideshow;
     let mut app = App {
         cfg,
         list,
@@ -975,6 +1047,8 @@ fn main() -> Result<()> {
         last_drag_seek: Instant::now(),
         cur_size: 0,
         toast: None,
+        slideshow: cfg_slideshow,
+        slide_next: None,
     };
     app.load_current();
 

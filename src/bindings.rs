@@ -46,6 +46,7 @@ pub enum Command {
     CycleFit,
     CycleSub,
     SubDelay(f64),
+    Slideshow,
     DragPan,
     Ignore,
 }
@@ -208,6 +209,7 @@ pub fn parse_command(s: &str) -> Result<Command, String> {
         "toggle-fullscreen" => none(Command::ToggleFullscreen),
         "cycle-fit" => none(Command::CycleFit),
         "cycle-sub" => none(Command::CycleSub),
+        "slideshow" => none(Command::Slideshow),
         "sub-delay" => Ok(Command::SubDelay(num()?)),
         "drag-pan" => none(Command::DragPan),
         "ignore" | "nop" => none(Command::Ignore),

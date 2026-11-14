@@ -54,6 +54,13 @@ Bez GUI toolkitu: text sa kreslí cez `fontdue` (atlas glyfov v GLES2), takže t
   (ak je myš nad lištou, ostane). Klik alebo ťah ľavým tlačidlom po dráhe = posun vo videu (pri ťahaní rýchly na keyframe,
   po pustení presný). Pri pauze sa vľavo zobrazí ikona pauzy. Vypnúť sa dá `seekbar=no`.
 
+## Slideshow
+
+- Medzerník pri obrázku (alebo `s`, príkaz `slideshow`) spustí/zastaví slideshow; pri videu medzerník ďalej pauzuje.
+- `slideshow-delay=5` je dĺžka zobrazenia obrázka v sekundách, video sa prehrá celé a potom príde ďalší súbor.
+  Ručné `next`/`prev` časovač obnoví. `slideshow-loop=yes` po poslednom súbore skočí na prvý.
+- Od štartu: `slideshow=yes` v konfigu alebo `rviewer --slideshow --slideshow-delay=3 ...`.
+
 ## Titulky
 
 - Externé: pri videu sa v jeho adresári hľadá `film.srt`, `film.sk.srt`, `film.en.forced.ass` (prípony srt, ass, ssa, vtt, sub, smi);

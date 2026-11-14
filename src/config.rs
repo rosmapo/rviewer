@@ -53,6 +53,12 @@ pub struct Config {
     pub seekbar: bool,
     /// Zobrazovať titulky (vložené aj externé).
     pub subtitles: bool,
+    /// Slideshow zapnutý od štartu.
+    pub slideshow: bool,
+    /// Dĺžka zobrazenia obrázka v slideshow (s).
+    pub slideshow_delay: f64,
+    /// Po poslednom súbore pokračovať od prvého.
+    pub slideshow_loop: bool,
     /// Preferované jazyky externých titulkov (v názve súboru: video.sk.srt).
     pub sub_languages: Vec<String>,
     /// Kódovanie textových titulkov, napr. CP1250 (prázdne = automaticky).
@@ -93,6 +99,9 @@ impl Default for Config {
             osd_accent: [0.90, 0.63, 0.05, 1.0],
             seekbar: true,
             subtitles: true,
+            slideshow: false,
+            slideshow_delay: 5.0,
+            slideshow_loop: true,
             sub_languages: exts("sk,slk,cs,cze,en,eng"),
             sub_encoding: String::new(),
             sub_font: String::new(),
@@ -222,6 +231,15 @@ impl Config {
             "osd-font-size" => self.osd_font_size = (num(val)? as f32).clamp(6.0, 200.0),
             "osd-color" => self.osd_color = parse_color(val)?,
             "osd-accent" => self.osd_accent = parse_color(val)?,
+            "slideshow" => self.slideshow = parse_bool(val)?,
+            "slideshow-delay" => {
+                let s = num(val)?;
+                if !(s >= 0.1) {
+                    return Err("slideshow-delay musí byť aspoň 0.1 s".into());
+                }
+                self.slideshow_delay = s;
+            }
+            "slideshow-loop" => self.slideshow_loop = parse_bool(val)?,
             "subtitles" => self.subtitles = parse_bool(val)?,
             "sub-languages" => self.sub_languages = exts(val),
             "sub-encoding" => self.sub_encoding = val.to_string(),
