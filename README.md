@@ -54,6 +54,11 @@ Bez GUI toolkitu: text sa kreslí cez `fontdue` (atlas glyfov v GLES2), takže t
   (ak je myš nad lištou, ostane). Klik alebo ťah ľavým tlačidlom po dráhe = posun vo videu (pri ťahaní rýchly na keyframe,
   po pustení presný). Pri pauze sa vľavo zobrazí ikona pauzy. Vypnúť sa dá `seekbar=no`.
 
+## Odstránenie vstavanej skratky
+
+Súbor `input.conf` vstavané skratky len dopĺňa a prepisuje. Skratku odstrániš riadkom `SPACE ignore`, alebo nastavíš
+`default-bindings=no` a v `input.conf` uvedieš všetky skratky, ktoré chceš (vzor je `input.conf` v repozitári).
+
 ## Slideshow
 
 - Medzerník pri obrázku (alebo `s`, príkaz `slideshow`) spustí/zastaví slideshow; pri videu medzerník ďalej pauzuje.

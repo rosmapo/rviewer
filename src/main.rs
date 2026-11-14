@@ -964,7 +964,7 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let Args { cfg, files, input_path, input_explicit } = parse_args()?;
-    let mut bindings = Bindings::defaults();
+    let mut bindings = if cfg.default_bindings { Bindings::defaults() } else { Bindings::default() };
     if let Some(p) = &input_path {
         match std::fs::read_to_string(p) {
             Ok(t) => {

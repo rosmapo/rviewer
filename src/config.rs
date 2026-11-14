@@ -55,6 +55,8 @@ pub struct Config {
     pub subtitles: bool,
     /// Slideshow zapnutý od štartu.
     pub slideshow: bool,
+    /// Použiť vstavané skratky (no = len tie z input.conf, ako input-default-bindings v mpv).
+    pub default_bindings: bool,
     /// Dĺžka zobrazenia obrázka v slideshow (s).
     pub slideshow_delay: f64,
     /// Po poslednom súbore pokračovať od prvého.
@@ -100,6 +102,7 @@ impl Default for Config {
             seekbar: true,
             subtitles: true,
             slideshow: false,
+            default_bindings: true,
             slideshow_delay: 5.0,
             slideshow_loop: true,
             sub_languages: exts("sk,slk,cs,cze,en,eng"),
@@ -231,6 +234,7 @@ impl Config {
             "osd-font-size" => self.osd_font_size = (num(val)? as f32).clamp(6.0, 200.0),
             "osd-color" => self.osd_color = parse_color(val)?,
             "osd-accent" => self.osd_accent = parse_color(val)?,
+            "default-bindings" => self.default_bindings = parse_bool(val)?,
             "slideshow" => self.slideshow = parse_bool(val)?,
             "slideshow-delay" => {
                 let s = num(val)?;
