@@ -46,12 +46,21 @@ pub enum Command {
     CycleFit,
     CycleSub,
     SubDelay(f64),
+    /// Násobí rýchlosť prehrávania.
+    Speed(f64),
+    SpeedReset,
+    FrameStep,
+    FrameBackStep,
+    LoopFile,
+    CycleAudio,
     Slideshow,
     /// Zoznam (playlist) na výber.
     Playlist,
     /// Spustí shellový príkaz; `remove` = aktuálny súbor zároveň zmizne zo zoznamu (napr. po presune do koša).
     Run { cmd: String, remove: bool },
     DragPan,
+    /// Počas držania tlačidla skutočná veľkosť (100 %) a posun ťahaním.
+    Peek,
     Ignore,
 }
 
@@ -225,7 +234,17 @@ pub fn parse_command(s: &str) -> Result<Command, String> {
         "slideshow" => none(Command::Slideshow),
         "playlist" => none(Command::Playlist),
         "sub-delay" => Ok(Command::SubDelay(num()?)),
+        "speed" => {
+            let v = num()?;
+            if v > 0.0 { Ok(Command::Speed(v)) } else { Err("speed musí byť kladné číslo".into()) }
+        }
+        "speed-reset" => none(Command::SpeedReset),
+        "frame-step" => none(Command::FrameStep),
+        "frame-back-step" => none(Command::FrameBackStep),
+        "loop-file" => none(Command::LoopFile),
+        "cycle-audio" => none(Command::CycleAudio),
         "drag-pan" => none(Command::DragPan),
+        "peek" => none(Command::Peek),
         "ignore" | "nop" => none(Command::Ignore),
         _ => Err(format!("neznámy príkaz '{name}'")),
     }

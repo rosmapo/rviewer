@@ -174,6 +174,7 @@ Predvolené:
 | Vstup | Príkaz |
 |---|---|
 | koliesko hore/dole | `prev` / `next` |
+| pravé tlačidlo (držať) + ťah | `peek` (ako FastStone: kým držíš, obrázok/video v 100 % a posúvaš ho myšou; po pustení sa vráti pôvodný pohľad) |
 | ľavé tlačidlo + ťah | `drag-pan` (len ak je obsah väčší ako obrazovka) |
 | stredné tlačidlo, Space | `pause` |
 | pravé tlačidlo, `i` | `info` (zapne/vypne info panel) |
@@ -186,8 +187,16 @@ Predvolené:
 | `v` | `cycle-fit` (video: skutočná veľkosť ↔ fit na obrazovku) |
 | `l` | `playlist` (zoznam súborov/staníc na výber) |
 | `j`, `z` / `x` | `cycle-sub`, `sub-delay -0.1` / `0.1` (titulky) |
+| `[` `]` / `<` `>`, Backspace | `speed 0.9` / `1.1` (rýchlosť prehrávania, výška tónu sa zachová), `speed-reset` |
+| `,` / `.` | `frame-back-step` / `frame-step` (po snímkoch, video sa pozastaví) |
+| `Ctrl+l`, `a` | `loop-file` (opakovanie videa, aj `loop-file=yes`), `cycle-audio` (zvuková stopa) |
 | `m`, `9`, `0` | `mute`, `volume -2` / `volume 2` |
 | Esc, `q` | `quit` |
+
+## Doostrenie
+
+`sharpen=0..1` v `rviewer.conf` (predvolene 0 = vypnuté) doostrí obraz len pri zmenšení (unsharp mask v shaderi; pri videu len jas).
+Hodnoty okolo 0.3–0.6 dajú vzhľad podobný swayimg/mpv.
 
 ## Čo nie je (zámerne / zatiaľ)
 

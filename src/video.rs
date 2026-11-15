@@ -18,6 +18,8 @@ pub struct VideoFrame {
     pub nv12: bool,
     pub full_range: bool,
     pub bt601: bool,
+    /// Snímková frekvencia (0 = neznáma).
+    pub fps: f64,
     /// Planes bez paddingu: Y, U, V (pri NV12 je [1] interleaved UV a [2] prázdne).
     pub planes: [Vec<u8>; 3],
 }
@@ -70,6 +72,9 @@ pub struct Player {
     pub buffer_pct: i32,
     title_tag: Option<String>,
     title_new: bool,
+    /// Rýchlosť prehrávania (1.0 = normálna).
+    pub speed: f64,
+    fps: f64,
 }
 
 fn extract(sample: &gst::Sample) -> Option<VideoFrame> {
@@ -109,6 +114,10 @@ fn extract(sample: &gst::Sample) -> Option<VideoFrame> {
         nv12,
         full_range,
         bt601,
+        fps: {
+            let f = info.fps();
+            if f.denom() > 0 { f.numer() as f64 / f.denom() as f64 } else { 0.0 }
+        },
         planes,
     })
 }
@@ -150,6 +159,10 @@ impl Player {
             .build()?;
 
         // Rotácia podľa metadát (mobilné videá).
+        // Zachová výšku tónu pri zmene rýchlosti.
+        if let Ok(st) = gst::ElementFactory::make("scaletempo").build() {
+            pipeline.set_property("audio-filter", st.to_value());
+        }
         if let Ok(flip) = gst::ElementFactory::make("videoflip").property_from_str("video-direction", "auto").build() {
             pipeline.set_property("video-filter", flip.to_value());
         }
@@ -205,6 +218,8 @@ impl Player {
             buffer_pct: 100,
             title_tag: None,
             title_new: false,
+            speed: 1.0,
+            fps: 0.0,
         };
         if stream.audio_only {
             // Bez okna: žiadne video ani titulky, dekóduje sa len zvuk.
@@ -288,8 +303,11 @@ impl Player {
 
     pub fn take_frame(&mut self) -> Option<VideoFrame> {
         let f = self.slot.lock().unwrap().take();
-        if f.is_some() {
+        if let Some(fr) = &f {
             self.got_frame = true;
+            if fr.fps > 0.0 {
+                self.fps = fr.fps;
+            }
         }
         f
     }
@@ -363,13 +381,115 @@ impl Player {
     pub fn seek_rel(&mut self, secs: f64) {
         let Some(pos) = self.pipeline.query_position::<gst::ClockTime>() else { return };
         let ns = (pos.nseconds() as f64 + secs * 1e9).max(0.0) as u64;
-        if self
-            .pipeline
-            .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, gst::ClockTime::from_nseconds(ns))
-            .is_ok()
-        {
+        if self.seek_rate(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, ns) {
             self.eos = false;
         }
+    }
+
+    /// Seek na `ns` s aktuálnou rýchlosťou prehrávania.
+    fn seek_rate(&self, flags: gst::SeekFlags, ns: u64) -> bool {
+        self.pipeline
+            .seek(
+                self.speed,
+                flags,
+                gst::SeekType::Set,
+                gst::ClockTime::from_nseconds(ns),
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            )
+            .is_ok()
+    }
+
+    /// Vynásobí rýchlosť `factor` (0.25..4); živé prúdy rýchlosť nemenia.
+    pub fn change_speed(&mut self, factor: f64) -> String {
+        self.set_speed((self.speed * factor).clamp(0.25, 4.0))
+    }
+
+    pub fn set_speed(&mut self, speed: f64) -> String {
+        if self.live || self.duration_secs().is_none() {
+            return "Rýchlosť: nedostupná pre tento prúd".into();
+        }
+        let speed = (speed * 100.0).round() / 100.0;
+        let old = self.speed;
+        self.speed = speed;
+        let pos = self.pipeline.query_position::<gst::ClockTime>().map(|p| p.nseconds()).unwrap_or(0);
+        if self.seek_rate(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, pos) {
+            self.eos = false;
+        } else {
+            self.speed = old;
+        }
+        format!("Rýchlosť: {}×", self.speed)
+    }
+
+    /// Jeden snímok dopredu (video sa pozastaví).
+    pub fn frame_step(&mut self) {
+        if !self.paused {
+            self.paused = true;
+            let _ = self.pipeline.set_state(gst::State::Paused);
+        }
+        if self.eos {
+            return;
+        }
+        let ev = gst::event::Step::new(gst::format::Buffers::ONE, 1.0, true, false);
+        let _ = self.pipeline.send_event(ev);
+    }
+
+    /// Jeden snímok dozadu (video sa pozastaví; presný seek o dĺžku snímku).
+    pub fn frame_back_step(&mut self) {
+        if !self.paused {
+            self.paused = true;
+            let _ = self.pipeline.set_state(gst::State::Paused);
+        }
+        let Some(pos) = self.pipeline.query_position::<gst::ClockTime>() else { return };
+        let fps = if self.fps > 0.0 { self.fps } else { 25.0 };
+        let ns = (pos.nseconds() as f64 - 1e9 / fps).max(0.0) as u64;
+        // Pri spätnom kroku rýchlosť nemá zmysel, hrá sa len jeden snímok.
+        let _ = self.pipeline.seek(
+            1.0,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            gst::SeekType::Set,
+            gst::ClockTime::from_nseconds(ns),
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        );
+        self.eos = false;
+    }
+
+    /// Odznova od začiatku (loop-file).
+    pub fn restart(&mut self) {
+        if self.seek_rate(gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, 0) {
+            self.eos = false;
+            if !self.paused {
+                let _ = self.pipeline.set_state(gst::State::Playing);
+            }
+        }
+    }
+
+    pub fn audio_label(&self) -> String {
+        let n: i32 = self.pipeline.property("n-audio");
+        if n <= 0 {
+            return "žiadna".into();
+        }
+        let cur: i32 = self.pipeline.property::<i32>("current-audio").max(0);
+        let tags = self.pipeline.emit_by_name::<Option<gst::TagList>>("get-audio-tags", &[&cur]);
+        let lang = tags.and_then(|t| {
+            ["language-name", "language-code"].iter().find_map(|k| t.generic(*k).and_then(|v| v.get::<&str>().ok().map(|s| s.to_string())))
+        });
+        match lang {
+            Some(l) => format!("{}/{} ({l})", cur + 1, n),
+            None => format!("{}/{}", cur + 1, n),
+        }
+    }
+
+    /// Ďalšia zvuková stopa (dokola).
+    pub fn cycle_audio(&mut self) -> String {
+        let n: i32 = self.pipeline.property("n-audio");
+        if n <= 1 {
+            return format!("Zvuk: {}", self.audio_label());
+        }
+        let cur: i32 = self.pipeline.property::<i32>("current-audio").max(0);
+        self.pipeline.set_property("current-audio", (cur + 1) % n);
+        format!("Zvuk: {}", self.audio_label())
     }
 
     pub fn duration_secs(&self) -> Option<f64> {
@@ -383,7 +503,7 @@ impl Player {
     pub fn seek_abs(&mut self, secs: f64, accurate: bool) {
         let ns = (secs.max(0.0) * 1e9) as u64;
         let flags = gst::SeekFlags::FLUSH | if accurate { gst::SeekFlags::ACCURATE } else { gst::SeekFlags::KEY_UNIT };
-        if self.pipeline.seek_simple(flags, gst::ClockTime::from_nseconds(ns)).is_ok() {
+        if self.seek_rate(flags, ns) {
             self.eos = false;
         }
     }

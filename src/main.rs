@@ -144,6 +144,8 @@ struct App {
     mods: u8,
     bindings: Bindings,
     drag_button: Option<u32>,
+    /// Prebieha `peek` (držanie tlačidla = 100 %).
+    peeking: bool,
     center_at: Option<Instant>,
     /// Čakáme na configure od kompozitora po `window-place-command`: (šírka, výška, termín).
     pending_place: Option<(i32, i32, Instant)>,
@@ -172,6 +174,7 @@ struct App {
     slideshow: bool,
     /// Kedy sa má prepnúť z aktuálneho obrázka (len pri slideshow).
     slide_next: Option<Instant>,
+    loop_file: bool,
     plist_open: bool,
     plist_sel: usize,
     plist_top: usize,
@@ -442,7 +445,9 @@ impl App {
                     self.gfx.upload_yuv(&f);
                     self.dirty = true;
                 }
-                if self.slideshow && p.eos {
+                if self.loop_file && p.eos {
+                    p.restart();
+                } else if self.slideshow && p.eos {
                     advance = true;
                 }
                 if !self.audio_only && p.is_audio_only() {
@@ -665,7 +670,14 @@ impl App {
                 l3 += " (stlmené)";
             }
             v.push(l3);
-            v.push(format!("titulky: {}", p.sub_label()));
+            let mut l4 = format!("titulky: {}  zvuk: {}", p.sub_label(), p.audio_label());
+            if p.speed != 1.0 {
+                l4 += &format!("  rýchlosť {}×", p.speed);
+            }
+            if self.loop_file {
+                l4 += "  (opakovanie)";
+            }
+            v.push(l4);
             if p.buffering {
                 v.push(format!("načítavam: {} %", p.buffer_pct));
             }
@@ -930,6 +942,12 @@ impl App {
         self.toast(format!("Hlasitosť: {:.0}%", self.volume));
     }
 
+    fn end_peek(&mut self) {
+        if std::mem::take(&mut self.peeking) && self.view.peek_end() {
+            self.dirty = true;
+        }
+    }
+
     fn run_command(&mut self, cmd: &Command) {
         let last = self.list.len() - 1;
         if matches!(cmd, Command::Pause | Command::Seek(_) | Command::SeekOrStep(_)) {
@@ -985,6 +1003,38 @@ impl App {
                     self.toast(msg);
                 }
             }
+            Command::Speed(f) => {
+                if let Content::Video(p) = &mut self.content {
+                    let msg = p.change_speed(*f);
+                    self.toast(msg);
+                }
+            }
+            Command::SpeedReset => {
+                if let Content::Video(p) = &mut self.content {
+                    let msg = p.set_speed(1.0);
+                    self.toast(msg);
+                }
+            }
+            Command::FrameStep | Command::FrameBackStep => {
+                if let Content::Video(p) = &mut self.content {
+                    if *cmd == Command::FrameStep {
+                        p.frame_step();
+                    } else {
+                        p.frame_back_step();
+                    }
+                    self.show_bar();
+                }
+            }
+            Command::LoopFile => {
+                self.loop_file = !self.loop_file;
+                self.toast(format!("Opakovanie videa: {}", if self.loop_file { "zapnuté" } else { "vypnuté" }));
+            }
+            Command::CycleAudio => {
+                if let Content::Video(p) = &mut self.content {
+                    let msg = p.cycle_audio();
+                    self.toast(msg);
+                }
+            }
             Command::Info => {
                 self.info_on = !self.info_on;
                 self.dirty = true;
@@ -1005,7 +1055,7 @@ impl App {
                 // Stav sa zmení až po odpovedi kompozitora (apply_resize).
                 self.wl.request_fullscreen(!self.wl.fullscreen);
             }
-            Command::DragPan | Command::Ignore => {}
+            Command::DragPan | Command::Peek | Command::Ignore => {}
         }
     }
 
@@ -1070,6 +1120,7 @@ impl App {
             Input::Leave => {
                 self.dragging = None;
                 self.drag_button = None;
+                self.end_peek();
             }
             Input::Motion { x, y } => {
                 let p = self.px(x, y);
@@ -1134,6 +1185,7 @@ impl App {
                     if self.drag_button == Some(button) {
                         self.dragging = None;
                         self.drag_button = None;
+                        self.end_peek();
                     }
                     return;
                 }
@@ -1141,6 +1193,12 @@ impl App {
                     if cmd == Command::DragPan {
                         self.dragging = Some(self.cursor);
                         self.drag_button = Some(button);
+                    } else if cmd == Command::Peek {
+                        self.view.peek_begin(self.cursor.0, self.cursor.1);
+                        self.peeking = true;
+                        self.dragging = Some(self.cursor);
+                        self.drag_button = Some(button);
+                        self.dirty = true;
                     } else {
                         self.run_command(&cmd);
                     }
@@ -1581,6 +1639,7 @@ fn main() -> Result<()> {
     let osd = Osd::load(&cfg);
     let video_fit = cfg.video_fit;
     let cfg_slideshow = cfg.slideshow;
+    let cfg_loop = cfg.loop_file;
     let mut app = App {
         cfg,
         list,
@@ -1603,6 +1662,7 @@ fn main() -> Result<()> {
         mods: 0,
         bindings,
         drag_button: None,
+        peeking: false,
         center_at: None,
         pending_place: None,
         cursor: (bw as f64 / 2.0, bh as f64 / 2.0),
@@ -1624,6 +1684,7 @@ fn main() -> Result<()> {
         toast: None,
         slideshow: cfg_slideshow,
         slide_next: None,
+        loop_file: cfg_loop,
         plist_open: false,
         plist_sel: 0,
         plist_top: 0,

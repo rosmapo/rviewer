@@ -63,8 +63,17 @@ varying vec2 v_tc;
 
 const FS_RGBA: &str = "
 uniform sampler2D u_tex;
+uniform vec2 u_texel;   // veľkosť jedného cieľového pixelu v súradniciach textúry
+uniform float u_sharp;  // sila doostrenia (0 = vypnuté)
 void main() {
     vec4 c = texture2D(u_tex, v_tc);
+    if (u_sharp > 0.0) {
+        vec3 b = texture2D(u_tex, v_tc + vec2(u_texel.x, 0.0)).rgb
+               + texture2D(u_tex, v_tc - vec2(u_texel.x, 0.0)).rgb
+               + texture2D(u_tex, v_tc + vec2(0.0, u_texel.y)).rgb
+               + texture2D(u_tex, v_tc - vec2(0.0, u_texel.y)).rgb;
+        c.rgb = clamp(c.rgb + u_sharp * (c.rgb - b * 0.25), 0.0, 1.0);
+    }
     gl_FragColor = vec4(c.rgb * c.a, c.a); // premultiplikované pre Wayland
 }
 ";
@@ -76,8 +85,17 @@ uniform sampler2D u_v;
 uniform float u_nv12;
 uniform vec4 u_k;      // rv, gu, gv, bu
 uniform vec3 u_range;  // yoff, yscale, cscale
+uniform vec2 u_texel;
+uniform float u_sharp;
 void main() {
     float y = texture2D(u_y, v_tc).r;
+    if (u_sharp > 0.0) {
+        float b = texture2D(u_y, v_tc + vec2(u_texel.x, 0.0)).r
+                + texture2D(u_y, v_tc - vec2(u_texel.x, 0.0)).r
+                + texture2D(u_y, v_tc + vec2(0.0, u_texel.y)).r
+                + texture2D(u_y, v_tc - vec2(0.0, u_texel.y)).r;
+        y = clamp(y + u_sharp * (y - b * 0.25), 0.0, 1.0);
+    }
     vec4 c1 = texture2D(u_u, v_tc);
     vec4 c2 = texture2D(u_v, v_tc);
     float u = c1.r;
@@ -124,6 +142,8 @@ pub struct Gfx {
     npot_ok: bool,
     mag: i32,
     bg: [f32; 4],
+    /// Sila doostrenia pri zmenšení (0..1).
+    sharpen: f32,
     width: i32,
     height: i32,
     content: Gpu,
@@ -220,8 +240,8 @@ impl Gfx {
         let mag = if cfg.filter == Filter::Nearest { gl::NEAREST } else { gl::LINEAR } as i32;
         let (prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, tex_thumb, max_tex, npot_ok);
         unsafe {
-            prog_rgba = program(VS, FS_RGBA, &["u_tex"])?;
-            prog_yuv = program(VS, FS_YUV, &["u_y", "u_u", "u_v", "u_nv12", "u_k", "u_range"])?;
+            prog_rgba = program(VS, FS_RGBA, &["u_tex", "u_texel", "u_sharp"])?;
+            prog_yuv = program(VS, FS_YUV, &["u_y", "u_u", "u_v", "u_nv12", "u_k", "u_range", "u_texel", "u_sharp"])?;
             prog_solid = program(VS, FS_SOLID, &["u_color"])?;
             prog_text = program(VS_OVL, FS_TEXT, &["u_tex", "u_color", "u_uv"])?;
             let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
@@ -251,7 +271,7 @@ impl Gfx {
         Ok(Gfx {
             egl, display, surface: esurf, _context: context, wl_egl,
             prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, tex_thumb,
-            max_tex, npot_ok, mag, bg, width: w, height: h, content: Gpu::None,
+            max_tex, npot_ok, mag, bg, sharpen: cfg.sharpen.clamp(0.0, 1.0) as f32, width: w, height: h, content: Gpu::None,
         })
     }
 
@@ -309,6 +329,7 @@ impl Gfx {
             gl::ActiveTexture(gl::TEXTURE0);
             gl::BindTexture(gl::TEXTURE_2D, self.tex_thumb);
             gl::Uniform1i(p.u[0], 0);
+            gl::Uniform1f(p.u[2], 0.0);
             self.bind_quad();
             gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
         }
@@ -353,11 +374,20 @@ impl Gfx {
             if let Some(p) = prog {
                 gl::UseProgram(p.id);
                 gl::Uniform4f(p.rect, r[0], r[1], r[2], r[3]);
+                // Doostrenie len pri zmenšení (cieľ menší ako zdroj).
+                let (cw, ch) = match self.content {
+                    Gpu::Rgba { w, h } | Gpu::Yuv { w, h, .. } => (w as f64, h as f64),
+                    Gpu::None => (1.0, 1.0),
+                };
+                let sharp = if self.sharpen > 0.0 && w > 0.0 && h > 0.0 && (w < cw || h < ch) { self.sharpen } else { 0.0 };
+                let (tx, ty) = ((1.0 / w.max(1.0)) as f32, (1.0 / h.max(1.0)) as f32);
                 match self.content {
                     Gpu::Rgba { .. } => {
                         gl::ActiveTexture(gl::TEXTURE0);
                         gl::BindTexture(gl::TEXTURE_2D, self.tex_rgba);
                         gl::Uniform1i(p.u[0], 0);
+                        gl::Uniform2f(p.u[1], tx, ty);
+                        gl::Uniform1f(p.u[2], sharp);
                     }
                     Gpu::Yuv { nv12, k, range, .. } => {
                         gl::ActiveTexture(gl::TEXTURE0);
@@ -372,6 +402,8 @@ impl Gfx {
                         gl::Uniform1f(p.u[3], if nv12 { 1.0 } else { 0.0 });
                         gl::Uniform4f(p.u[4], k[0], k[1], k[2], k[3]);
                         gl::Uniform3f(p.u[5], range[0], range[1], range[2]);
+                        gl::Uniform2f(p.u[6], tx, ty);
+                        gl::Uniform1f(p.u[7], sharp);
                     }
                     Gpu::None => {}
                 }

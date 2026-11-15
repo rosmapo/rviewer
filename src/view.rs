@@ -21,13 +21,15 @@ pub struct View {
     reference: Option<(f64, f64)>,
     /// true = zväčšiť/zmenšiť tak, aby sa obsah zmestil na obrazovku (inak skutočná veľkosť).
     upscale: bool,
+    /// Uložený zoom a posun počas `peek` (podržanie = 100 %).
+    saved: Option<(f64, (f64, f64))>,
 }
 
 const MAX_ZOOM_LOG2: f64 = 8.0;
 
 impl View {
     pub fn new() -> Self {
-        View { cw: 0.0, ch: 0.0, sw: 1.0, sh: 1.0, base: 1.0, zoom: 0.0, pan: (0.0, 0.0), min_size: SizeSpec::NONE, max_size: SizeSpec::NONE, reference: None, upscale: false }
+        View { cw: 0.0, ch: 0.0, sw: 1.0, sh: 1.0, base: 1.0, zoom: 0.0, pan: (0.0, 0.0), min_size: SizeSpec::NONE, max_size: SizeSpec::NONE, reference: None, upscale: false, saved: None }
     }
 
     pub fn has_content(&self) -> bool {
@@ -97,8 +99,39 @@ impl View {
     }
 
     pub fn reset(&mut self) {
+        self.saved = None;
         self.zoom = 0.0;
         self.pan = (0.0, 0.0);
+    }
+
+    /// Prepne na skutočnú veľkosť (100 %) tak, aby bod pod (cx, cy) zostal na mieste; pôvodný stav si zapamätá.
+    pub fn peek_begin(&mut self, cx: f64, cy: f64) {
+        if !self.has_content() {
+            return;
+        }
+        if self.saved.is_none() {
+            self.saved = Some((self.zoom, self.pan));
+        }
+        let s0 = self.scale();
+        let (px, py) = (cx - self.sw / 2.0, cy - self.sh / 2.0);
+        let (qx, qy) = ((px - self.pan.0) / s0, (py - self.pan.1) / s0);
+        self.zoom = -self.base.log2();
+        let s1 = self.scale();
+        self.pan = (px - qx * s1, py - qy * s1);
+        self.clamp_pan();
+    }
+
+    /// Vráti zoom a posun spred `peek_begin`; true ak sa niečo zmenilo.
+    pub fn peek_end(&mut self) -> bool {
+        match self.saved.take() {
+            Some((z, p)) => {
+                self.zoom = z;
+                self.pan = p;
+                self.clamp_pan();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn scale(&self) -> f64 {

@@ -59,6 +59,10 @@ pub struct Config {
     pub subtitles: bool,
     /// Slideshow zapnutý od štartu.
     pub slideshow: bool,
+    /// Opakovať jedno video dokola.
+    pub loop_file: bool,
+    /// Doostrenie pri zmenšení obrázka/videa, 0 (vypnuté) .. 1.
+    pub sharpen: f64,
     /// Dopredu načítať susedné obrázky na pozadí.
     pub preload: bool,
     /// Dĺžka bufferu pri sieťovom videu v sekundách (0 = predvolené).
@@ -113,6 +117,8 @@ impl Default for Config {
             subtitles: true,
             slideshow: false,
             preload: true,
+            loop_file: false,
+            sharpen: 0.0,
             net_buffer: 3.0,
             default_bindings: true,
             slideshow_delay: 5.0,
@@ -255,6 +261,14 @@ impl Config {
                 self.net_buffer = s;
             }
             "preload" => self.preload = parse_bool(val)?,
+            "loop-file" => self.loop_file = parse_bool(val)?,
+            "sharpen" => {
+                let s: f64 = val.trim().parse().map_err(|_| format!("neplatné číslo '{val}'"))?;
+                if !(0.0..=1.0).contains(&s) {
+                    return Err("sharpen musí byť v rozsahu 0..1".into());
+                }
+                self.sharpen = s;
+            }
             "slideshow" => self.slideshow = parse_bool(val)?,
             "slideshow-delay" => {
                 let s = num(val)?;
