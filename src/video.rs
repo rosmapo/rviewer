@@ -33,6 +33,27 @@ pub struct SubOpts {
     pub font: String,
 }
 
+/// Voľby sieťového prehrávania a režimu bez okna.
+#[derive(Default)]
+pub struct StreamOpts {
+    /// Buffer v sekundách (0 = predvolený).
+    pub net_buffer: f64,
+    /// Len zvuk (režim --nogui).
+    pub audio_only: bool,
+    pub referrer: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+/// URI pre GStreamer: sieťová adresa ostane, lokálna cesta sa prevedie na file://.
+pub fn to_uri(path: &Path) -> Result<String> {
+    let s = path.to_string_lossy();
+    if crate::playlist::is_url(&s) {
+        Ok(s.into_owned())
+    } else {
+        Ok(gst::glib::filename_to_uri(path, None)?.to_string())
+    }
+}
+
 pub struct Player {
     pipeline: gst::Element,
     slot: Slot,
@@ -42,6 +63,13 @@ pub struct Player {
     pub got_frame: bool,
     sub_on: bool,
     sub_delay_ms: i64,
+    /// Živý prenos (bez prebufferovania a bez trvania).
+    pub live: bool,
+    /// Pauza kvôli načítavaniu zo siete, percentá bufferu.
+    pub buffering: bool,
+    pub buffer_pct: i32,
+    title_tag: Option<String>,
+    title_new: bool,
 }
 
 fn extract(sample: &gst::Sample) -> Option<VideoFrame> {
@@ -93,8 +121,8 @@ fn store(slot: &Slot, sample: &gst::Sample, wake_fd: RawFd) {
 }
 
 impl Player {
-    pub fn new(path: &Path, volume: f64, mute: bool, wake_fd: RawFd, subs: &SubOpts) -> Result<Player> {
-        let uri = gst::glib::filename_to_uri(path, None)?;
+    /// `uri` = file:// alebo sieťová adresa (pozri `to_uri`).
+    pub fn new(uri: &str, volume: f64, mute: bool, wake_fd: RawFd, subs: &SubOpts, stream: &StreamOpts) -> Result<Player> {
         let caps = gst::Caps::builder("video/x-raw").field("format", gst::List::new(["NV12", "I420"])).build();
         let sink = gst_app::AppSink::builder().caps(&caps).build();
         let slot: Slot = Arc::new(Mutex::new(None));
@@ -115,7 +143,7 @@ impl Player {
         );
 
         let pipeline = gst::ElementFactory::make("playbin")
-            .property("uri", uri.as_str())
+            .property("uri", uri)
             .property("video-sink", sink.to_value())
             .property("volume", volume / 100.0)
             .property("mute", mute)
@@ -141,9 +169,52 @@ impl Player {
         if !subs.font.is_empty() {
             pipeline.set_property("subtitle-font-desc", subs.font.as_str());
         }
-        let p = Player { pipeline, slot, paused: false, eos: false, got_frame: false, sub_on: subs.enabled, sub_delay_ms: 0 };
-        p.set_text_flag(subs.enabled);
-        p.pipeline.set_state(gst::State::Playing)?;
+        if stream.referrer.is_some() || stream.user_agent.is_some() {
+            // HTTP hlavičky z playlistu (napr. Referer) pre hlavný zdroj; pri HLS sa na segmenty nemusia preniesť.
+            let (referrer, agent) = (stream.referrer.clone(), stream.user_agent.clone());
+            pipeline.connect("source-setup", false, move |args| {
+                let src = args.get(1)?.get::<gst::Element>().ok()?;
+                if let Some(ua) = &agent {
+                    if src.find_property("user-agent").is_some() {
+                        src.set_property("user-agent", ua.as_str());
+                    }
+                }
+                if let Some(r) = &referrer {
+                    if src.find_property("extra-headers").is_some() {
+                        let h = gst::Structure::builder("headers").field("Referer", r.as_str()).build();
+                        src.set_property("extra-headers", &h);
+                    }
+                }
+                None
+            });
+        }
+        if !uri.starts_with("file://") && stream.net_buffer > 0.0 {
+            // Sieť: buffer v sekundách (0 = predvolený z GStreameru).
+            pipeline.set_property("buffer-duration", (stream.net_buffer * 1e9) as i64);
+        }
+        let mut p = Player {
+            pipeline,
+            slot,
+            paused: false,
+            eos: false,
+            got_frame: false,
+            sub_on: subs.enabled,
+            sub_delay_ms: 0,
+            live: false,
+            buffering: false,
+            buffer_pct: 100,
+            title_tag: None,
+            title_new: false,
+        };
+        if stream.audio_only {
+            // Bez okna: žiadne video ani titulky, dekóduje sa len zvuk.
+            set_flag(&p.pipeline, "video", false);
+            set_flag(&p.pipeline, "text", false);
+        } else {
+            p.set_text_flag(subs.enabled);
+        }
+        let st = p.pipeline.set_state(gst::State::Playing)?;
+        p.live = st == gst::StateChangeSuccess::NoPreroll;
         Ok(p)
     }
 
@@ -230,6 +301,32 @@ impl Player {
             while let Some(msg) = bus.pop() {
                 match msg.view() {
                     gst::MessageView::Eos(_) => self.eos = true,
+                    // Prúdy bez trvania (rádiá, živé vysielanie) sa nepozastavujú kvôli bufferu, hrajú hneď ako prídu dáta.
+                    gst::MessageView::Buffering(b) if !self.live && self.duration_secs().is_some() => {
+                        // Sieťové video: pri nízkom buffri pozastaviť, po naplnení pokračovať.
+                        let pct = b.percent();
+                        self.buffer_pct = pct;
+                        if pct < 100 {
+                            if !self.buffering {
+                                self.buffering = true;
+                                let _ = self.pipeline.set_state(gst::State::Paused);
+                            }
+                        } else if self.buffering {
+                            self.buffering = false;
+                            if !self.paused {
+                                let _ = self.pipeline.set_state(gst::State::Playing);
+                            }
+                        }
+                    }
+                    gst::MessageView::Tag(t) => {
+                        if let Some(title) = t.tags().get::<gst::tags::Title>() {
+                            let s = title.get().to_string();
+                            if self.title_tag.as_deref() != Some(s.as_str()) {
+                                self.title_tag = Some(s);
+                                self.title_new = true;
+                            }
+                        }
+                    }
                     gst::MessageView::Error(e) => {
                         errors.push(format!("{} ({})", e.error(), e.debug().map(|d| d.to_string()).unwrap_or_default()))
                     }
@@ -238,6 +335,16 @@ impl Player {
             }
         }
         errors
+    }
+
+    /// Prúd, ktorý má zvuk, ale žiadne video (rádio, hudba). Platí až keď sú stopy zistené (pipeline aspoň PAUSED).
+    pub fn is_audio_only(&self) -> bool {
+        if self.got_frame || self.pipeline.current_state() < gst::State::Paused {
+            return false;
+        }
+        let nv: i32 = self.pipeline.property("n-video");
+        let na: i32 = self.pipeline.property("n-audio");
+        nv == 0 && na > 0
     }
 
     pub fn toggle_pause(&mut self) {
@@ -278,6 +385,15 @@ impl Player {
         let flags = gst::SeekFlags::FLUSH | if accurate { gst::SeekFlags::ACCURATE } else { gst::SeekFlags::KEY_UNIT };
         if self.pipeline.seek_simple(flags, gst::ClockTime::from_nseconds(ns)).is_ok() {
             self.eos = false;
+        }
+    }
+
+    /// Nový názov skladby z tagov prúdu (rádio), ak sa zmenil od posledného volania.
+    pub fn take_title(&mut self) -> Option<String> {
+        if std::mem::take(&mut self.title_new) {
+            self.title_tag.clone()
+        } else {
+            None
         }
     }
 
@@ -350,7 +466,7 @@ const THUMB_SETTLE: std::time::Duration = std::time::Duration::from_millis(180);
 impl Thumber {
     /// `(w, h)` = rozmery náhľadu v px (pomer strán videa už musí byť zachovaný).
     pub fn new(path: &Path, (w, h): (u32, u32), wake_fd: RawFd) -> Result<Thumber> {
-        let uri = gst::glib::filename_to_uri(path, None)?;
+        let uri = to_uri(path)?;
         let tail = format!("videoconvert ! videoscale ! video/x-raw,format=RGBA,width={w},height={h} ! appsink name=thsink");
         let bin = gst::parse::bin_from_description(&format!("videoflip video-direction=auto ! {tail}"), true)
             .or_else(|_| gst::parse::bin_from_description(&tail, true))?;

@@ -20,10 +20,11 @@ use osd::{BarState, Osd};
 use playlist::{Entry, Kind};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use config::SizeSpec;
-use video::{Player, SubOpts, Thumber};
+use video::{Player, StreamOpts, SubOpts, Thumber};
 use view::View;
 use wayland_client::{backend::WaylandError, globals::registry_queue_init, Connection};
 use wl::Input;
@@ -31,7 +32,7 @@ use wl::Input;
 const HELP: &str = "\
 rviewer – minimálny fullscreen prehliadač obrázkov a videí (Wayland)
 
-Použitie: rviewer [voľby] [súbor|adresár ...]
+Použitie: rviewer [voľby] [súbor|adresár|URL ...]
 
   Jeden súbor: načíta sa celý jeho adresár (autoload) a začne sa na ňom.
   Viac súborov/adresárov: zoznam v zadanom poradí.
@@ -42,7 +43,7 @@ Voľby:
   --input-conf=SÚBOR  iné skratky (predvolene ~/.config/rviewer/input.conf)
   --no-input-conf   len vstavané skratky
   --config-dir=ADRESÁR  použije ADRESÁR/rviewer.conf a ADRESÁR/input.conf
-  --slideshow       spustí slideshow (dĺžka: --slideshow-delay=SEKUNDY)
+  --nogui           bez okna a bez Waylandu: prehrá len zvuk (rádiá, hudba), ovláda sa z terminála
   --window          okno veľkosti obsahu namiesto fullscreenu (--fullscreen = naspäť)
   --slideshow       spustí slideshow (dĺžka obrázka: --slideshow-delay=SEKUNDY)
   --KĽÚČ=HODNOTA    prepíše ľubovoľnú voľbu z konfigu (napr. --background=#202020)
@@ -71,6 +72,49 @@ enum Content {
     None,
     Image { anim: Option<Anim> },
     Video(Player),
+}
+
+/// Nastavené signálmi SIGINT/SIGTERM/SIGHUP: slučka sa ukončí čisto a terminál sa vráti do pôvodného režimu.
+static QUIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    QUIT.store(true, AtomicOrdering::SeqCst);
+}
+
+/// Terminál v režime po znakoch (bez echa), kým beží zvuk bez okna; pri zahodení sa obnoví.
+struct TtyGuard {
+    orig: libc::termios,
+}
+
+impl TtyGuard {
+    /// Len ak je stdin terminál a rviewer je jeho popredný proces (inak by ho shell zastavil).
+    fn enable() -> Option<TtyGuard> {
+        unsafe {
+            if libc::isatty(0) == 0 || libc::tcgetpgrp(0) != libc::getpgrp() {
+                return None;
+            }
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) != 0 {
+                return None;
+            }
+            let orig = t;
+            t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+            t.c_cc[libc::VMIN] = 0;
+            t.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(0, libc::TCSANOW, &t) != 0 {
+                return None;
+            }
+            Some(TtyGuard { orig })
+        }
+    }
+}
+
+impl Drop for TtyGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &self.orig);
+        }
+    }
 }
 
 type LoadMsg = (u64, Result<LoadedImage, String>);
@@ -128,6 +172,17 @@ struct App {
     slideshow: bool,
     /// Kedy sa má prepnúť z aktuálneho obrázka (len pri slideshow).
     slide_next: Option<Instant>,
+    plist_open: bool,
+    plist_sel: usize,
+    plist_top: usize,
+    plist_rows: usize,
+    /// Prúd má len zvuk: okno sa vôbec nezobrazí a ovláda sa z terminálu.
+    audio_only: bool,
+    /// Okno už dostalo prvý obraz (je zobrazené).
+    mapped: bool,
+    /// Dokedy sa čaká s mapovaním okna na prvý snímok videa (potom sa zobrazí aj prázdne).
+    map_deadline: Instant,
+    tty: Option<TtyGuard>,
     /// Náhľady pri lište: druhý pipeline, vytvorí sa pri prvom pohybe myši nad lištou.
     thumber: Option<Thumber>,
     thumb_failed: bool,
@@ -144,6 +199,10 @@ impl App {
     }
 
     fn load_current(&mut self) {
+        self.audio_only = false;
+        self.tty = None;
+        let wait = if playlist::is_url(&self.list[self.idx].path.to_string_lossy()) { 4000 } else { 1500 };
+        self.map_deadline = Instant::now() + Duration::from_millis(wait);
         self.content = Content::None; // zahodí prípadný Player
         self.slide_next = None;
         self.thumber = None;
@@ -160,7 +219,7 @@ impl App {
         self.seek_target = None;
         let entry = self.list[self.idx].clone();
         self.cur_size = std::fs::metadata(&entry.path).map(|m| m.len()).unwrap_or(0);
-        let name = entry.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = entry.display_name();
         self.wl.toplevel.set_title(name);
         match entry.kind {
             Kind::Image => {
@@ -176,7 +235,15 @@ impl App {
                     wake(wake_w);
                 });
             }
-            Kind::Video => match Player::new(&entry.path, self.volume, self.muted, self.wake_w, &self.sub_opts(&entry.path)) {
+            Kind::Video => match video::to_uri(&entry.path).and_then(|uri| {
+                    let stream = StreamOpts {
+                        net_buffer: self.cfg.net_buffer,
+                        audio_only: false,
+                        referrer: entry.referrer.clone(),
+                        user_agent: entry.user_agent.clone(),
+                    };
+                    Player::new(&uri, self.volume, self.muted, self.wake_w, &self.sub_opts(&entry.path), &stream)
+                }) {
                 Ok(p) => self.content = Content::Video(p),
                 Err(e) => {
                     eprintln!("{}: {e}", entry.path.display());
@@ -189,7 +256,8 @@ impl App {
     }
 
     fn sub_opts(&self, video: &std::path::Path) -> SubOpts {
-        let ext_uri = if self.cfg.subtitles {
+        let is_net = playlist::is_url(&video.to_string_lossy());
+        let ext_uri = if self.cfg.subtitles && !is_net {
             subs::find_external(video, &self.cfg.sub_languages)
                 .and_then(|p| gst_uri(&p))
         } else {
@@ -357,6 +425,7 @@ impl App {
         let mut refit = false;
         let mut broken = false;
         let mut advance = false;
+        let mut detect_audio = false;
         let fit = self.video_fit && self.wl.fullscreen;
         match &mut self.content {
             Content::Video(p) => {
@@ -376,10 +445,13 @@ impl App {
                 if self.slideshow && p.eos {
                     advance = true;
                 }
+                if !self.audio_only && p.is_audio_only() {
+                    detect_audio = true;
+                }
                 for e in p.poll_bus() {
                     eprintln!("video: {e}");
-                    // Chyba pred prvým snímkom = súbor sa nedá prehrať.
                     if !p.got_frame {
+                        // Chyba pred prvým snímkom = súbor sa nedá prehrať.
                         broken = true;
                     }
                 }
@@ -397,6 +469,16 @@ impl App {
         }
         if refit {
             self.fit_window();
+        }
+        if detect_audio {
+            self.audio_only = true;
+            if !self.mapped {
+                self.tty = TtyGuard::enable();
+                eprintln!(
+                    "zvuk bez obrazu: okno sa nezobrazuje{}",
+                    if self.tty.is_some() { ", ovládanie z terminálu (skratky z input.conf, q = koniec)" } else { " (koniec: Ctrl+C / kill)" }
+                );
+            }
         }
         if broken && self.cfg.skip_broken {
             self.skip_broken();
@@ -559,7 +641,7 @@ impl App {
 
     fn info_lines(&self) -> Vec<String> {
         let e = &self.list[self.idx];
-        let name = e.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = e.display_name();
         let mut l2 = format!("[{}/{}]", self.idx + 1, self.list.len());
         if self.view.has_content() {
             l2 += &format!("  {}x{}  {:.0}%", self.view.cw as u32, self.view.ch as u32, self.view.scale() * 100.0);
@@ -584,6 +666,9 @@ impl App {
             }
             v.push(l3);
             v.push(format!("titulky: {}", p.sub_label()));
+            if p.buffering {
+                v.push(format!("načítavam: {} %", p.buffer_pct));
+            }
         }
         v
     }
@@ -594,13 +679,30 @@ impl App {
         }
         let show_bar = self.bar_visible();
         let toast = self.toast.as_ref().filter(|(_, t)| Instant::now() < *t).map(|(s, _)| s.clone());
-        if !self.info_on && !show_bar && toast.is_none() {
+        if !self.info_on && !show_bar && toast.is_none() && !self.plist_open {
             self.osd.clear_bar();
             return;
         }
         let s = self.scale as f32;
         let screen = ((self.wl.width * self.scale) as f32, (self.wl.height * self.scale) as f32);
         self.osd.set_px(self.cfg.osd_font_size * s);
+        if self.plist_open {
+            let items: Vec<String> = self
+                .list
+                .iter()
+                .enumerate()
+                .map(|(i, e)| format!("{} {:>3}. {}", if i == self.idx { ">" } else { " " }, i + 1, e.display_name()))
+                .collect();
+            self.plist_scroll();
+            let header = format!("Zoznam {}/{}   ↑↓ výber · Enter prehrať · Esc zavrieť", self.plist_sel + 1, items.len());
+            let (color, accent) = (self.cfg.osd_color, self.cfg.osd_accent);
+            let rows = self.osd.draw_list(&mut self.gfx, s, screen, &header, &items, self.plist_top, self.plist_sel, color, accent);
+            if rows != self.plist_rows {
+                self.plist_rows = rows;
+                self.plist_scroll();
+                self.dirty = true;
+            }
+        }
         if !self.info_on {
             if let Some(t) = &toast {
                 self.osd.draw_info(&mut self.gfx, s, screen, &[t.clone()], self.cfg.osd_color);
@@ -640,11 +742,38 @@ impl App {
         if self.pending_place.is_some() {
             return Ok(()); // čakáme na veľkosť od kompozitora; dirty ostáva
         }
+        if !self.mapped {
+            // Okno sa nezobrazí, kým nie je čo ukázať: zvukový prúd ho nezobrazí vôbec,
+            // video až s prvým snímkom (alebo po uplynutí map_deadline, aby chyba nezostala skrytá).
+            let hold = match &self.content {
+                Content::Video(p) => self.audio_only || (!p.got_frame && Instant::now() < self.map_deadline),
+                _ => false,
+            };
+            if hold {
+                self.dirty = false;
+                return Ok(());
+            }
+        }
         self.dirty = false;
         let rect = self.view.rect();
         self.gfx.draw(rect)?;
         self.draw_overlay();
-        self.gfx.present()
+        let r = self.gfx.present();
+        self.mapped = true;
+        r
+    }
+
+    /// Znaky z terminála (zvuk bez okna) prevedené na skratky z input.conf.
+    fn handle_tty(&mut self) {
+        let (sources, quit) = read_tty_sources();
+        if quit {
+            self.wl.running = false;
+        }
+        for src in sources {
+            if let Some(cmd) = self.bindings.get(&Trigger { src, mods: 0 }).cloned() {
+                self.run_command(&cmd);
+            }
+        }
     }
 
     fn px(&self, x: f64, y: f64) -> (f64, f64) {
@@ -678,7 +807,8 @@ impl App {
 
     /// Náhľad pri myši nad dráhou lišty (alebo pri ťahaní po nej).
     fn update_thumb(&mut self) {
-        let want = if self.cfg.thumbnails && self.bar_visible() {
+        let is_net = playlist::is_url(&self.list[self.idx].path.to_string_lossy());
+        let want = if self.cfg.thumbnails && !is_net && self.bar_visible() {
             match &self.content {
                 Content::Video(p) => p.duration_secs().and_then(|d| {
                     let f = if self.bar_drag {
@@ -724,6 +854,68 @@ impl App {
         }
     }
 
+    fn plist_scroll(&mut self) {
+        let rows = self.plist_rows.max(1);
+        if self.plist_sel < self.plist_top {
+            self.plist_top = self.plist_sel;
+        } else if self.plist_sel >= self.plist_top + rows {
+            self.plist_top = self.plist_sel + 1 - rows;
+        }
+    }
+
+    fn plist_toggle(&mut self) {
+        self.plist_open = !self.plist_open;
+        if self.plist_open {
+            self.plist_sel = self.idx;
+            self.plist_scroll();
+        }
+        self.dirty = true;
+    }
+
+    fn plist_move(&mut self, delta: i64) {
+        let n = self.list.len() as i64;
+        self.plist_sel = (self.plist_sel as i64).saturating_add(delta).clamp(0, n - 1) as usize;
+        self.plist_scroll();
+        self.dirty = true;
+    }
+
+    fn plist_play(&mut self, i: usize) {
+        self.plist_open = false;
+        self.dirty = true;
+        if i != self.idx {
+            self.goto(i);
+        }
+    }
+
+    /// Klávesa pri otvorenom zozname; `true` = spracovaná (nepustí sa ďalej).
+    fn plist_key(&mut self, code: u32, sym0: Option<u32>, sym: Option<u32>) -> bool {
+        let rows = self.plist_rows.max(1) as i64;
+        match code {
+            103 => self.plist_move(-1),
+            108 => self.plist_move(1),
+            104 => self.plist_move(-rows),
+            109 => self.plist_move(rows),
+            102 => self.plist_move(i64::MIN / 2),
+            107 => self.plist_move(i64::MAX / 2),
+            28 | 96 => {
+                let i = self.plist_sel;
+                self.plist_play(i);
+            }
+            1 => {
+                self.plist_open = false;
+                self.dirty = true;
+            }
+            _ => {
+                if let Some(cmd) = self.lookup_key(code, sym0, sym) {
+                    if matches!(cmd, Command::Playlist | Command::Quit) {
+                        self.run_command(&cmd);
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn toast(&mut self, text: String) {
         eprintln!("{text}");
         self.toast = Some((text, Instant::now() + Duration::from_millis(2000)));
@@ -754,6 +946,7 @@ impl App {
                 }
             }
             Command::Slideshow => self.toggle_slideshow(),
+            Command::Playlist => self.plist_toggle(),
             Command::Run { cmd, remove } => self.run_external(cmd, *remove),
             Command::Next => self.navigate(1),
             Command::Prev => self.navigate(-1),
@@ -854,6 +1047,9 @@ impl App {
                     }
                     return;
                 }
+                if self.plist_open && self.plist_key(code, sym0, sym) {
+                    return;
+                }
                 if let Some(cmd) = self.lookup_key(code, sym0, sym) {
                     self.run_command(&cmd);
                     if cmd.repeatable() && self.wl.repeat.0 > 0 {
@@ -900,6 +1096,19 @@ impl App {
                 self.update_thumb();
             }
             Input::Button { button, pressed } => {
+                if self.plist_open {
+                    if button == BTN_LEFT && pressed {
+                        match self.osd.list_hit(self.cursor.0, self.cursor.1) {
+                            Some(Some(i)) => self.plist_play(i),
+                            Some(None) => {}
+                            None => {
+                                self.plist_open = false;
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                    return;
+                }
                 if button == BTN_LEFT {
                     if pressed {
                         if self.bar_visible() {
@@ -953,6 +1162,10 @@ impl App {
                 };
                 if let Some(src) = src {
                     self.axis_acc = 0.0;
+                    if self.plist_open {
+                        self.plist_move(if matches!(src, Source::WheelDown) { 3 } else { -3 });
+                        return;
+                    }
                     if let Some(cmd) = self.lookup(src) {
                         self.run_command(&cmd);
                     }
@@ -962,6 +1175,9 @@ impl App {
     }
 
     fn tick_timers(&mut self) {
+        if !self.mapped && !self.audio_only && matches!(self.content, Content::Video(_)) && Instant::now() >= self.map_deadline {
+            self.dirty = true;
+        }
         if let Some(th) = &mut self.thumber {
             th.service();
         }
@@ -1031,6 +1247,9 @@ impl App {
         if let Some(t) = self.center_at {
             put(t);
         }
+        if !self.mapped && !self.audio_only && matches!(self.content, Content::Video(_)) && Instant::now() < self.map_deadline {
+            put(self.map_deadline);
+        }
         if let Some(t) = self.slide_next {
             put(t);
         }
@@ -1070,11 +1289,178 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("rviewer").join("rviewer.conf"))
 }
 
+/// Prečíta znaky z terminála (stdin) a prevedie ich na zdroje skratiek; druhá hodnota = Ctrl+C.
+fn read_tty_sources() -> (Vec<Source>, bool) {
+    let mut out = Vec::new();
+    let mut quit = false;
+    let mut buf = [0u8; 32];
+    let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
+    if n <= 0 {
+        return (out, quit);
+    }
+    let b = &buf[..n as usize];
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == 0x1b && b.get(i + 1) == Some(&b'[') {
+            // Šípky a pod.: ESC [ A/B/C/D/H/F alebo ESC [ N ~
+            let (code, used) = match (b.get(i + 2), b.get(i + 3)) {
+                (Some(b'A'), _) => (Some(103), 3),
+                (Some(b'B'), _) => (Some(108), 3),
+                (Some(b'C'), _) => (Some(106), 3),
+                (Some(b'D'), _) => (Some(105), 3),
+                (Some(b'H'), _) => (Some(102), 3),
+                (Some(b'F'), _) => (Some(107), 3),
+                (Some(b'3'), Some(b'~')) => (Some(111), 4),
+                (Some(b'5'), Some(b'~')) => (Some(104), 4),
+                (Some(b'6'), Some(b'~')) => (Some(109), 4),
+                _ => (None, 3),
+            };
+            out.extend(code.map(Source::Key));
+            i += used;
+        } else {
+            match c {
+                0x03 => quit = true,
+                0x1b => out.push(Source::Key(1)),
+                b' ' => out.push(Source::Key(57)),
+                b'\n' | b'\r' => out.push(Source::Key(28)),
+                0x7f => out.push(Source::Key(14)),
+                0x20..=0x7e => out.push(Source::Sym(char_to_keysym(c as char))),
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    (out, quit)
+}
+
+/// `--nogui`: bez okna a bez Waylandu. Prehráva zvuk zo zoznamu (súbory aj adresy), ovláda sa z terminála.
+fn headless(list: Vec<playlist::Entry>, start: usize, cfg: Config, bindings: Bindings, wake_r: RawFd, wake_w: RawFd) -> Result<()> {
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        }
+    }
+    let tty = TtyGuard::enable();
+    if tty.is_some() {
+        eprintln!("bez okna: ovládanie z terminála podľa input.conf (q = koniec, medzerník = pauza)");
+    }
+    let sub = SubOpts { enabled: false, ext_uri: None, encoding: String::new(), font: String::new() };
+    let n = list.len();
+    let (mut idx, mut volume, mut muted) = (start, cfg.volume, false);
+    'outer: loop {
+        if QUIT.load(AtomicOrdering::SeqCst) {
+            break;
+        }
+        let entry = list[idx].clone();
+        let opened = video::to_uri(&entry.path).and_then(|uri| {
+                let stream = StreamOpts {
+                    net_buffer: cfg.net_buffer,
+                    audio_only: true,
+                    referrer: entry.referrer.clone(),
+                    user_agent: entry.user_agent.clone(),
+                };
+                Player::new(&uri, volume, muted, wake_w, &sub, &stream)
+            });
+        let mut p = match opened {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{}: {e}", entry.path.display());
+                if idx + 1 < n {
+                    idx += 1;
+                    continue;
+                }
+                break;
+            }
+        };
+        eprintln!("Prehrávam: {}", entry.path.display());
+        let (mut advance, mut target) = (false, None::<usize>);
+        loop {
+            if QUIT.load(AtomicOrdering::SeqCst) {
+                break 'outer;
+            }
+            for e in p.poll_bus() {
+                eprintln!("chyba: {e}");
+                advance = true;
+            }
+            if let Some(t) = p.take_title() {
+                eprintln!("♪ {t}");
+            }
+            if p.eos {
+                advance = true;
+            }
+            if advance {
+                if idx + 1 < n {
+                    idx += 1;
+                    continue 'outer;
+                }
+                break 'outer;
+            }
+            if let Some(t) = target.take() {
+                idx = t;
+                continue 'outer;
+            }
+
+            let mut pfds = [
+                libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
+            ];
+            let nfds: libc::nfds_t = if tty.is_some() { 2 } else { 1 };
+            unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
+            if pfds[0].revents & libc::POLLIN != 0 {
+                let mut buf = [0u8; 64];
+                while unsafe { libc::read(wake_r, buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
+            }
+            if nfds == 2 && pfds[1].revents & libc::POLLIN != 0 {
+                let (sources, quit) = read_tty_sources();
+                if quit {
+                    break 'outer;
+                }
+                for src in sources {
+                    let Some(cmd) = bindings.get(&Trigger { src, mods: 0 }).cloned() else { continue };
+                    match cmd {
+                        Command::Quit => break 'outer,
+                        Command::Pause => p.toggle_pause(),
+                        Command::Next if idx + 1 < n => target = Some(idx + 1),
+                        Command::Prev if idx > 0 => target = Some(idx - 1),
+                        Command::First => target = Some(0),
+                        Command::Last => target = Some(n - 1),
+                        Command::Playlist => {
+                            for (i, e) in list.iter().enumerate() {
+                                eprintln!("{} {:>3}. {}", if i == idx { ">" } else { " " }, i + 1, e.display_name());
+                            }
+                        }
+                        Command::Seek(s) | Command::SeekOrStep(s) => p.seek_rel(s),
+                        Command::Volume(d) => {
+                            volume = (volume + d).clamp(0.0, 200.0);
+                            p.set_volume(volume);
+                            eprintln!("Hlasitosť: {volume:.0}%");
+                        }
+                        Command::Mute => {
+                            muted = !muted;
+                            p.set_mute(muted);
+                            eprintln!("Zvuk: {}", if muted { "stlmený" } else { "zapnutý" });
+                        }
+                        Command::Info => {
+                            let pos = p.position_secs().map(fmt_time).unwrap_or_else(|| "-".into());
+                            let dur = p.duration_secs().map(fmt_time).unwrap_or_else(|| "LIVE".into());
+                            eprintln!("{}  {pos} / {dur}", entry.path.display());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 struct Args {
     cfg: Config,
     files: Vec<String>,
     input_path: Option<PathBuf>,
     input_explicit: bool,
+    nogui: bool,
 }
 
 fn parse_args() -> Result<Args> {
@@ -1087,6 +1473,7 @@ fn parse_args() -> Result<Args> {
     let mut overrides = Vec::new();
     let mut files = Vec::new();
     let mut only_files = false;
+    let mut nogui = false;
     for a in args {
         if only_files || !a.starts_with("--") && a != "-h" {
             files.push(a);
@@ -1105,6 +1492,8 @@ fn parse_args() -> Result<Args> {
             input_file = Some(PathBuf::from(p));
         } else if a == "--no-input-conf" {
             no_input = true;
+        } else if a == "--nogui" || a == "--no-window" {
+            nogui = true;
         } else if a == "--window" {
             overrides.push(("fullscreen".to_string(), "no".to_string()));
         } else if a == "--slideshow" {
@@ -1136,11 +1525,11 @@ fn parse_args() -> Result<Args> {
     for (k, v) in overrides {
         cfg.set(&k, &v).map_err(|e| anyhow::anyhow!("--{k}: {e}"))?;
     }
-    Ok(Args { cfg, files, input_path, input_explicit })
+    Ok(Args { cfg, files, input_path, input_explicit, nogui })
 }
 
 fn main() -> Result<()> {
-    let Args { cfg, files, input_path, input_explicit } = parse_args()?;
+    let Args { cfg, files, input_path, input_explicit, nogui } = parse_args()?;
     let mut bindings = if cfg.default_bindings { Bindings::defaults() } else { Bindings::default() };
     if let Some(p) = &input_path {
         match std::fs::read_to_string(p) {
@@ -1164,6 +1553,10 @@ fn main() -> Result<()> {
         bail!("pipe2 zlyhal");
     }
     let (wake_r, wake_w) = (fds[0], fds[1]);
+
+    if nogui {
+        return headless(list, start, cfg, bindings, wake_r, wake_w);
+    }
 
     let conn = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<wl::State>(&conn)?;
@@ -1231,15 +1624,31 @@ fn main() -> Result<()> {
         toast: None,
         slideshow: cfg_slideshow,
         slide_next: None,
+        plist_open: false,
+        plist_sel: 0,
+        plist_top: 0,
+        plist_rows: 12,
+        audio_only: false,
+        mapped: false,
+        map_deadline: Instant::now(),
+        tty: None,
         thumber: None,
         thumb_failed: false,
         thumb_time: None,
         thumb_dim: None,
         thumb_pts: None,
     };
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        }
+    }
     app.load_current();
 
     while app.wl.running {
+        if QUIT.load(AtomicOrdering::SeqCst) {
+            break;
+        }
         queue.dispatch_pending(&mut app.wl)?;
         let inputs = std::mem::take(&mut app.wl.inputs);
         for i in inputs {
@@ -1265,8 +1674,10 @@ fn main() -> Result<()> {
         let mut pfds = [
             libc::pollfd { fd: wl_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
         ];
-        unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) };
+        let nfds: libc::nfds_t = if app.tty.is_some() { 3 } else { 2 };
+        unsafe { libc::poll(pfds.as_mut_ptr(), nfds, timeout) };
         if pfds[0].revents & libc::POLLIN != 0 {
             if let Err(e) = guard.read() {
                 if !matches!(&e, WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock) {
@@ -1275,6 +1686,9 @@ fn main() -> Result<()> {
             }
         } else {
             drop(guard);
+        }
+        if nfds == 3 && pfds[2].revents & libc::POLLIN != 0 {
+            app.handle_tty();
         }
         if pfds[1].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 64];

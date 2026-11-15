@@ -54,10 +54,70 @@ Bez GUI toolkitu: text sa kreslí cez `fontdue` (atlas glyfov v GLES2), takže t
   (ak je myš nad lištou, ostane). Klik alebo ťah ľavým tlačidlom po dráhe = posun vo videu (pri ťahaní rýchly na keyframe,
   po pustení presný). Pri pauze sa vľavo zobrazí ikona pauzy. Vypnúť sa dá `seekbar=no`.
 
+## Rýchle listovanie
+
+`preload=yes` na pozadí dopredu načíta susedný obrázok v smere listovania (aj predchádzajúci). Prepnutie je potom okamžité.
+Animované GIF-y sa nepredčítavajú. Stojí to pamäť pre dva dekódované obrázky; vypnutie: `preload=no`.
+
 ## Odstránenie vstavanej skratky
 
 Súbor `input.conf` vstavané skratky len dopĺňa a prepisuje. Skratku odstrániš riadkom `SPACE ignore`, alebo nastavíš
 `default-bindings=no` a v `input.conf` uvedieš všetky skratky, ktoré chceš (vzor je `input.conf` v repozitári).
+
+## Streamy z internetu
+
+`rviewer URL` prehrá priamy odkaz na video (`https://…/film.mp4`), HLS/DASH (`.m3u8`, `.mpd`) a prúdy `rtsp://`, `rtmp://` a pod.
+Adresy sa prehrávajú priamo cez GStreamer, bez `yt-dlp`, takže začnú hrať hneď. Stránky typu YouTube (adresa nie je video, ale HTML) tak nefungujú;
+na ne použi mpv. Adresy a súbory sa dajú miešať v jednom zozname: `rviewer a.mp4 https://…`.
+
+- Pri nízkom bufferi sa prehrávanie videa samo pozastaví a v info paneli je `načítavam: N %`. Buffer je `net-buffer=3` s (rádiá a živé prúdy bez trvania sa kvôli bufferu nepozastavujú).
+- Živé prenosy nemajú trvanie ani vyhľadávaciu lištu. Náhľady na lište a externé titulky sa pri adresách nepoužívajú.
+- Obrázky z internetu zatiaľ nie.
+- Treba `gstreamer1.0-plugins-good` (HTTP), `gstreamer1.0-plugins-bad` (HLS/DASH), `glib-networking` (HTTPS).
+
+## Playlist (`.m3u`, `.m3u8`, `.pls`)
+
+`rviewer ~/Dokumenty/tv.m3u` načíta zoznam staníc alebo súborov (aj spolu s ďalšími argumentmi). Názvy sa berú z `#EXTINF`
+(a z `tvg-name`), relatívne cesty od adresára playlistu, riadky `#EXTVLCOPT:http-referrer=` a `http-user-agent=` aj atribút `http-referrer="…"`
+sa pošlú ako hlavičky pri otváraní adresy (pri HLS sa môžu uplatniť len na prvý dotaz, nie na jednotlivé segmenty).
+Lokálny `.m3u8` s `#EXT-X-` (HLS súbor, nie zoznam) sa berie ako video. Zoznam z internetu (`http://…/zoznam.m3u`) zatiaľ nie, stiahni ho.
+
+Skratka `l` (príkaz `playlist`) otvorí zoznam v strede obrazovky: šípky a PgUp/PgDn/Home/End vyberajú, `Enter` prehrá, `Esc` alebo `l` zavrie,
+kolieskom myši sa posúva a kliknutím sa vybraná položka prehrá. Zoznam funguje pre ľubovoľný zoznam súborov (aj priečinok s fotkami).
+V `--nogui` vypíše zoznam do terminála.
+
+## Bez okna (`--nogui`)
+
+`rviewer --nogui https://play.radio7.sk/128` (alebo `--no-window`) nevytvorí žiadne okno a ani sa nepripája k Waylandu. Prehráva len zvuk,
+začne hneď a funguje aj bez grafickej relácie. Zoznam môže obsahovať súbory aj adresy; po skončení skladby ide ďalšia a po poslednej
+sa program ukončí. Názov skladby z tagov prúdu (rádio) sa vypíše ako `♪ …`.
+
+Ovládanie z terminála podľa `input.conf`: `q` koniec, medzerník pauza, `9`/`0` hlasitosť, šípky pretáčanie, `Enter`/`PgDn` ďalšia, `PgUp` predchádzajúca,
+`i` stav, Ctrl+C koniec. Bez terminála sa ukončí cez `pkill rviewer`.
+
+## Zvuk bez okna (rádiá, hudba)
+
+Ak prúd nemá obraz (rádio, mp3, ...), okno sa vôbec nezobrazí a rviewer beží na pozadí ako mpv bez okna. Okno sa neukáže ani na chvíľu,
+lebo sa s mapovaním čaká na prvý snímok videa (najviac 1,5 s pri súbore, 4 s pri sieti, potom sa zobrazí aj prázdne, aby chyba nezostala skrytá).
+
+- Ak je rviewer spustený v termináli a je jeho popredným procesom, ovláda sa z neho: znaky a medzerník podľa `input.conf`
+  (`q` koniec, medzerník pauza, `9`/`0` hlasitosť, šípky...), Ctrl+C ukončí.
+- Inak sa ukončí cez `Ctrl+C`, `kill`/`pkill rviewer`; SIGINT, SIGTERM a SIGHUP ukončia program čisto.
+- Správy (hlasitosť, titulky...) idú na stderr.
+
+## Vlastné príkazy (`run`)
+
+V `input.conf` môžeš skratke priradiť shellový príkaz: `run PRÍKAZ` ho spustí na pozadí, `run-remove PRÍKAZ` ho spustí
+a súbor zároveň zmizne zo zoznamu (po presune do koša, premenovaní...). V príkaze fungujú `{path}`, `{dir}`, `{name}` a `{stem}`
+(vložia sa správne ošetrené, takže medzery a úvodzovky v názve nevadia); cesta je aj v premennej `RVIEWER_PATH`.
+
+```
+DEL run-remove gio trash {path}
+e   run gimp {path}
+c   run sh -c 'printf %s {path} | wl-copy'
+```
+
+Pozor: `run-remove` zoznam upraví vždy, aj keď príkaz zlyhá. Riadok v `input.conf` nesmie obsahovať ` #` (považuje sa za komentár).
 
 ## Náhľady na lište
 
@@ -124,6 +184,7 @@ Predvolené:
 | PgUp/PgDn, Enter, Home/End | `prev`/`next`, `first`/`last` |
 | `f`, `F11` | `toggle-fullscreen` (okno ↔ fullscreen) |
 | `v` | `cycle-fit` (video: skutočná veľkosť ↔ fit na obrazovku) |
+| `l` | `playlist` (zoznam súborov/staníc na výber) |
 | `j`, `z` / `x` | `cycle-sub`, `sub-delay -0.1` / `0.1` (titulky) |
 | `m`, `9`, `0` | `mute`, `volume -2` / `volume 2` |
 | Esc, `q` | `quit` |

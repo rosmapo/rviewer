@@ -47,6 +47,8 @@ pub enum Command {
     CycleSub,
     SubDelay(f64),
     Slideshow,
+    /// Zoznam (playlist) na výber.
+    Playlist,
     /// Spustí shellový príkaz; `remove` = aktuálny súbor zároveň zmizne zo zoznamu (napr. po presune do koša).
     Run { cmd: String, remove: bool },
     DragPan,
@@ -221,6 +223,7 @@ pub fn parse_command(s: &str) -> Result<Command, String> {
         "cycle-fit" => none(Command::CycleFit),
         "cycle-sub" => none(Command::CycleSub),
         "slideshow" => none(Command::Slideshow),
+        "playlist" => none(Command::Playlist),
         "sub-delay" => Ok(Command::SubDelay(num()?)),
         "drag-pan" => none(Command::DragPan),
         "ignore" | "nop" => none(Command::Ignore),

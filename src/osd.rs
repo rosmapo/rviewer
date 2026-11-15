@@ -31,6 +31,20 @@ pub struct Osd {
     /// Posuvné miesto v atlase: (x, y, výška riadku).
     pen: (u32, u32, u32),
     bar: Option<BarGeom>,
+    list: Option<ListGeom>,
+}
+
+/// Poloha zoznamu na obrazovke (px buffera) pre klikanie myšou.
+#[derive(Clone, Copy)]
+struct ListGeom {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    rows_y: f32,
+    lh: f32,
+    top: usize,
+    rows: usize,
 }
 
 fn load_font(cfg: &Config) -> Option<fontdue::Font> {
@@ -69,7 +83,7 @@ impl Osd {
         if font.is_none() {
             eprintln!("rviewer: nenašiel som font pre OSD (nastav osd-font=/cesta/k/fontu.ttf); info a lišta sú vypnuté");
         }
-        Osd { font, px: 0.0, glyphs: HashMap::new(), atlas_ready: false, pen: (0, 0, 0), bar: None }
+        Osd { font, px: 0.0, glyphs: HashMap::new(), atlas_ready: false, pen: (0, 0, 0), bar: None, list: None }
     }
 
     pub fn available(&self) -> bool {
@@ -83,6 +97,54 @@ impl Osd {
             self.glyphs.clear();
             self.atlas_ready = false;
         }
+    }
+
+    /// Zoznam v strede obrazovky; vráti počet viditeľných riadkov (na posúvanie výberu).
+    pub fn draw_list(
+        &mut self, gfx: &mut Gfx, s: f32, screen: (f32, f32), header: &str, items: &[String], top: usize, sel: usize,
+        color: [f32; 4], accent: [f32; 4],
+    ) -> usize {
+        let (_, lh) = self.line_metrics();
+        let pad = 12.0 * s;
+        let w = (screen.0 * 0.7).min(900.0 * s).max(200.0 * s).min(screen.0 - 2.0 * pad);
+        let max_h = (screen.1 * 0.8).max(lh * 4.0);
+        let rows_max = (((max_h - 2.0 * pad - lh - 6.0 * s) / lh).floor() as usize).max(1);
+        let rows = rows_max.min(items.len()).max(1);
+        let h = 2.0 * pad + lh + 6.0 * s + rows as f32 * lh;
+        let (x, y) = (((screen.0 - w) / 2.0).round(), ((screen.1 - h) / 2.0).max(0.0).round());
+        gfx.fill_rect(x, y, w, h, [0.0, 0.0, 0.0, 0.82]);
+        let head = self.fit(header, w - 2.0 * pad);
+        self.draw_text(gfx, x + pad, y + pad, &head, color);
+        let rows_y = y + pad + lh + 6.0 * s;
+        let top = top.min(items.len().saturating_sub(rows));
+        for r in 0..rows {
+            let i = top + r;
+            let Some(item) = items.get(i) else { break };
+            let ry = rows_y + r as f32 * lh;
+            if i == sel {
+                gfx.fill_rect(x + pad / 2.0, ry, w - pad, lh, [accent[0], accent[1], accent[2], 0.45]);
+            }
+            let t = self.fit(item, w - 2.0 * pad);
+            self.draw_text(gfx, x + pad, ry, &t, color);
+        }
+        self.list = Some(ListGeom { x, y, w, h, rows_y, lh, top, rows });
+        rows
+    }
+
+    /// Index položky pod bodom; `Some(None)` = klik na zoznam mimo riadkov, `None` = mimo zoznamu.
+    pub fn list_hit(&self, px: f64, py: f64) -> Option<Option<usize>> {
+        let g = self.list?;
+        let (px, py) = (px as f32, py as f32);
+        if px < g.x || px > g.x + g.w || py < g.y || py > g.y + g.h {
+            return None;
+        }
+        if py >= g.rows_y {
+            let r = ((py - g.rows_y) / g.lh) as usize;
+            if r < g.rows {
+                return Some(Some(g.top + r));
+            }
+        }
+        Some(None)
     }
 
     pub fn clear_bar(&mut self) {

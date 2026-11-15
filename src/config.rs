@@ -61,6 +61,8 @@ pub struct Config {
     pub slideshow: bool,
     /// Dopredu načítať susedné obrázky na pozadí.
     pub preload: bool,
+    /// Dĺžka bufferu pri sieťovom videu v sekundách (0 = predvolené).
+    pub net_buffer: f64,
     /// Použiť vstavané skratky (no = len tie z input.conf, ako input-default-bindings v mpv).
     pub default_bindings: bool,
     /// Dĺžka zobrazenia obrázka v slideshow (s).
@@ -111,6 +113,7 @@ impl Default for Config {
             subtitles: true,
             slideshow: false,
             preload: true,
+            net_buffer: 3.0,
             default_bindings: true,
             slideshow_delay: 5.0,
             slideshow_loop: true,
@@ -244,6 +247,13 @@ impl Config {
             "osd-color" => self.osd_color = parse_color(val)?,
             "osd-accent" => self.osd_accent = parse_color(val)?,
             "default-bindings" => self.default_bindings = parse_bool(val)?,
+            "net-buffer" => {
+                let s = num(val)?;
+                if s < 0.0 {
+                    return Err("net-buffer nesmie byť záporný".into());
+                }
+                self.net_buffer = s;
+            }
             "preload" => self.preload = parse_bool(val)?,
             "slideshow" => self.slideshow = parse_bool(val)?,
             "slideshow-delay" => {
