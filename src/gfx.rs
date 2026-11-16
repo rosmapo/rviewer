@@ -124,6 +124,7 @@ enum Gpu {
 pub struct Gfx {
     egl: egl::DynamicInstance<egl::EGL1_4>,
     display: egl::Display,
+    config: egl::Config,
     surface: egl::Surface,
     _context: egl::Context,
     wl_egl: WlEglSurface,
@@ -269,7 +270,7 @@ impl Gfx {
         let a = cfg.background[3];
         let bg = [cfg.background[0] * a, cfg.background[1] * a, cfg.background[2] * a, a];
         Ok(Gfx {
-            egl, display, surface: esurf, _context: context, wl_egl,
+            egl, display, config, surface: esurf, _context: context, wl_egl,
             prog_rgba, prog_yuv, prog_solid, prog_text, tex_atlas, vbo, tex_rgba, tex_y, tex_u, tex_v, tex_thumb,
             max_tex, npot_ok, mag, bg, sharpen: cfg.sharpen.clamp(0.0, 1.0) as f32, width: w, height: h, content: Gpu::None,
         })
@@ -279,6 +280,21 @@ impl Gfx {
         self.wl_egl.resize(w, h, 0, 0);
         self.width = w;
         self.height = h;
+    }
+
+    /// Zahodí EGL okno a vytvorí nové priamo v cieľovej veľkosti. Používa sa pred prvým zobrazením okna:
+    /// Mesa pri obyčajnom `wl_egl_window_resize` môže prvý buffer ešte alokovať v starej veľkosti,
+    /// takže by sa najprv zobrazilo okno zlej veľkosti.
+    pub fn recreate_surface(&mut self, surface: &WlSurface, w: i32, h: i32) -> Result<()> {
+        self.egl.make_current(self.display, None, None, None)?;
+        let _ = self.egl.destroy_surface(self.display, self.surface);
+        self.wl_egl = WlEglSurface::new(surface.id(), w, h)?;
+        self.surface = unsafe { self.egl.create_window_surface(self.display, self.config, self.wl_egl.ptr() as *mut c_void, None) }?;
+        self.egl.make_current(self.display, Some(self.surface), Some(self.surface), Some(self._context))?;
+        let _ = self.egl.swap_interval(self.display, 0);
+        self.width = w;
+        self.height = h;
+        Ok(())
     }
 
     pub fn clear_content(&mut self) {

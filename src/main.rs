@@ -560,6 +560,16 @@ impl App {
         let lw = ((w / s as f64).round() as i32).max(1);
         let lh = ((h / s as f64).round() as i32).max(1);
         if (lw, lh) != (self.wl.width, self.wl.height) {
+            if !self.mapped {
+                // Okno ešte nie je zobrazené (video sa zobrazí až s prvým snímkom). Rovnako ako mpv ho zobrazíme hneď
+                // v cieľovej veľkosti (aj prvý buffer) a polohu necháme na kompozitore; hook sa spustí až pri zmene veľkosti.
+                let s = self.scale.max(1);
+                if let Err(e) = self.gfx.recreate_surface(&self.wl.surface, lw * s, lh * s) {
+                    eprintln!("EGL: {e}");
+                }
+                self.apply_window_size(lw, lh);
+                return;
+            }
             if !self.cfg.window_place_cmd.trim().is_empty() {
                 // Kompozitor zmení veľkosť aj polohu naraz; nový obsah nakreslíme až po jeho configure,
                 // takže okno neskáče. Do tej doby ostáva na obrazovke posledný nakreslený snímok.
