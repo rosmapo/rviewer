@@ -44,6 +44,8 @@ pub struct Config {
     pub window_center_cmd: String,
     /// Príkaz, ktorý kompozitoru zmení veľkosť AJ polohu okna naraz (bez skákania).
     pub window_place_cmd: String,
+    /// Okno umiestňuje a centruje rviewer sám cez Wayfire IPC (bez externého skriptu).
+    pub wayfire_ipc: bool,
     /// Cesta k fontu pre OSD; prázdne = nájde sa cez fc-match.
     pub osd_font: String,
     /// Veľkosť písma OSD (logické px).
@@ -107,6 +109,7 @@ impl Default for Config {
             fullscreen: true,
             window_center_cmd: String::new(),
             window_place_cmd: String::new(),
+            wayfire_ipc: true,
             osd_font: String::new(),
             osd_font_size: 18.0,
             osd_color: [1.0, 1.0, 1.0, 1.0],
@@ -292,6 +295,7 @@ impl Config {
             "sub-font" => self.sub_font = val.to_string(),
             "seekbar" => self.seekbar = parse_bool(val)?,
             "seekbar-timeout" => self.seekbar_timeout_ms = num(val)?.max(0.0) as u64,
+            "wayfire-ipc" => self.wayfire_ipc = parse_bool(val)?,
             "window-place-command" => self.window_place_cmd = val.to_string(),
             "window-center-command" => self.window_center_cmd = val.to_string(),
             // Zrušené voľby (posun je teraz v input.conf: `seek`, `seek-or-step`).

@@ -35,12 +35,18 @@ prepísať aj z príkazového riadku (`--background=#202020`, `--window`).
 
 `fullscreen=no` v konfigu alebo `--window`: okno má vždy veľkosť obrázka/videa (väčšie ako obrazovka sa zmenší) a mení sa
 pri každom ďalšom súbore. Klávesa `f` (`toggle-fullscreen`) prepína medzi oknom a fullscreenom. Skutočný stav sa berie z kompozitora, takže funguje rovnako, aj keď fullscreen prepneš v kompozitore (napr. F11 vo Wayfire).
-Wayland nedovoľuje klientovi okno premiestniť, takže **centrovanie bez skákania** zabezpečuje voliteľný
-`window-place-command`: pri zmene obrázka sa spustí príkaz, ktorý kompozitoru nastaví veľkosť aj polohu naraz
-(premenné `RVIEWER_WIDTH`, `RVIEWER_HEIGHT`, `RVIEWER_PID`; skript pre Wayfire je `contrib/wayfire-center.py`).
+Wayland nedovoľuje klientovi okno premiestniť, preto sa **centrovanie bez skákania** rieši cez kompozitor:
+
+- **Wayfire (predvolene, `wayfire-ipc=yes`)**: rviewer sa pripojí na IPC socket (`WAYFIRE_SOCKET`) a sám okno vycentruje,
+  externý skript netreba. Pri prvom zobrazení odoberá udalosť `view-pre-map`: Wayfire okno podrží, rviewer ho
+  vycentruje (v pracovnej oblasti výstupu bez panelov) a zavolá `unblock-map`, takže okno vznikne rovno na správnom
+  mieste. Pri zmene obrázka/videa nastaví veľkosť aj polohu jedným `configure-view`. Mimo Wayfire sa nič nedeje.
+- **Iné kompozitory**: voliteľný `window-place-command` spustí príkaz, ktorý kompozitoru nastaví veľkosť aj polohu naraz
+  (premenné `RVIEWER_WIDTH`, `RVIEWER_HEIGHT`, `RVIEWER_PID`; starší skript pre Wayfire je `contrib/wayfire-center.py`).
+  Príkaz má prednosť pred `wayfire-ipc`. Staršie `window-center-command` okno až dodatočne presunie (môže preskočiť).
+
 `rviewer` medzitým nechá na obrazovke posledný nakreslený snímok a nový nakreslí až po odpovedi (configure)
-kompozitora; ak do 400 ms nepríde, zmení veľkosť sám. Staršie `window-center-command` okno až dodatočne presunie
-(môže preskočiť). Bez oboch príkazov okno umiestni kompozitor podľa svojich pravidiel.
+kompozitora; ak do 400 ms nepríde, zmení veľkosť sám. Bez týchto nastavení okno umiestni kompozitor podľa svojich pravidiel.
 V tilingovom kompozitore veľkosť okna určuje kompozitor a obsah sa doň zmestí.
 
 ## OSD: info panel a vyhľadávacia lišta

@@ -9,6 +9,7 @@ mod playlist;
 mod subs;
 mod video;
 mod view;
+mod wfipc;
 mod wl;
 
 use anyhow::{bail, Result};
@@ -147,6 +148,8 @@ struct App {
     /// Prebieha `peek` (držanie tlačidla = 100 %).
     peeking: bool,
     center_at: Option<Instant>,
+    /// Okno umiestňujeme sami cez Wayfire IPC (okno aj veľkosť naraz).
+    wf_place: bool,
     /// Čakáme na configure od kompozitora po `window-place-command`: (šírka, výška, termín).
     pending_place: Option<(i32, i32, Instant)>,
     cursor: (f64, f64),
@@ -570,12 +573,12 @@ impl App {
                 self.apply_window_size(lw, lh);
                 return;
             }
-            if !self.cfg.window_place_cmd.trim().is_empty() {
+            if self.place_enabled() {
                 // Kompozitor zmení veľkosť aj polohu naraz; nový obsah nakreslíme až po jeho configure,
                 // takže okno neskáče. Do tej doby ostáva na obrazovke posledný nakreslený snímok.
                 if self.pending_place.map(|(pw, ph, _)| (pw, ph)) != Some((lw, lh)) {
                     self.pending_place = Some((lw, lh, Instant::now() + Duration::from_millis(400)));
-                    self.run_hook(&self.cfg.window_place_cmd.clone(), lw, lh);
+                    self.run_place(lw, lh);
                 }
                 self.dirty = true;
                 return;
@@ -596,6 +599,25 @@ impl App {
         self.gfx.resize(lw * s, lh * s);
         self.view.set_screen((lw * s) as f64, (lh * s) as f64);
         self.dirty = true;
+    }
+
+    /// Máme čím umiestniť okno naraz s veľkosťou (externý príkaz alebo Wayfire IPC)?
+    fn place_enabled(&self) -> bool {
+        !self.cfg.window_place_cmd.trim().is_empty() || self.wf_place
+    }
+
+    /// Zmení veľkosť a polohu okna (logické px): externý príkaz má prednosť, inak Wayfire IPC.
+    fn run_place(&self, w: i32, h: i32) {
+        let cmd = self.cfg.window_place_cmd.trim();
+        if !cmd.is_empty() {
+            self.run_hook(cmd, w, h);
+        } else {
+            std::thread::spawn(move || {
+                if let Err(e) = wfipc::place_self(w, h) {
+                    eprintln!("wayfire ipc: {e}");
+                }
+            });
+        }
     }
 
     fn run_center_hook(&self) {
@@ -1627,6 +1649,12 @@ fn main() -> Result<()> {
     }
 
     let conn = Connection::connect_to_env()?;
+    // Okno vo Wayfire umiestnime ešte pred zobrazením (odber `view-pre-map` musí bežať skôr, než okno vznikne).
+    // (Vo fullscreene sa pri štarte nič nepodrží; okno sa umiestni až po prepnutí do okna, cez `place_self`.)
+    let wf_place = cfg.wayfire_ipc && wfipc::available();
+    if wf_place && !cfg.fullscreen {
+        wfipc::spawn_first_map_placer();
+    }
     let (globals, mut queue) = registry_queue_init::<wl::State>(&conn)?;
     let qh = queue.handle();
     let mut st = wl::State::new(&globals, &qh, cfg.fullscreen)?;
@@ -1675,6 +1703,7 @@ fn main() -> Result<()> {
         peeking: false,
         center_at: None,
         pending_place: None,
+        wf_place,
         cursor: (bw as f64 / 2.0, bh as f64 / 2.0),
         dragging: None,
         axis_acc: 0.0,
